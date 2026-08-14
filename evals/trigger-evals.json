@@ -1,0 +1,83 @@
+[
+  {
+    "query": "положил HAND.toml и SKILL.md в /data/hands/clipper, сделал openfang hand install clipper — в списке он появился, активировал, всё ок. после docker restart openfang-openfang-1 hand пропал совсем, в /api/hands его нет. почему не сохранился и как класть его так, чтобы переживал рестарт?",
+    "should_trigger": true
+  },
+  {
+    "query": "агент не видит ключ. делаю docker exec -it openfang-openfang-1 openfang hand check-deps clip, в ответ ✘ Failed: Missing Authorization: Bearer <api_key> header. при этом api_key в config.toml лежит первой строкой, и hand list / agent list работают нормально. что я упускаю?",
+    "should_trigger": true
+  },
+  {
+    "query": "why does my nightly job fire every 5 minutes? i put [schedule] periodic = { cron = \"0 3 * * *\" } in the agent manifest because i want one summary run at 3am, but the logs show a turn every 300 seconds and it's chewing through tokens. how do i get an actual wall-clock nightly run",
+    "should_trigger": true
+  },
+  {
+    "query": "i want to add a provider with a custom base_url — my own openai-compatible endpoint at https://api.hyperfusion.io/v1 — and register openai/gpt-oss-120b against it so the context window and per-token pricing aren't invented. what's the right order of calls, and is there anything about the provider name i should be careful with?",
+    "should_trigger": true
+  },
+  {
+    "query": "GET http://127.0.0.1:4200/api/cron/jobs works fine with no key at all, but every POST I make comes back 400 with a completely empty body — no error message, nothing in the logs. I'm grabbing the key with grep '^api_key' config.toml | cut -d'\"' -f2 and it looks like a normal token. what am I doing wrong?",
+    "should_trigger": true
+  },
+  {
+    "query": "the agent's tool calls keep failing whenever it tries something like `yt-dlp --write-auto-subs $URL | tee /data/out/captions.txt` — the error mentions rejected characters. I already set the exec policy to full. is there any way to let it use a pipe or a redirect, or do I have to restructure the whole step?",
+    "should_trigger": true
+  },
+  {
+    "query": "надо снять бэкап всего /var/lib/docker/volumes/openfang_openfang-data/_data вместе с sqlite базой, желательно не останавливая контейнер. обычный cp базы прокатит или её порвёт из-за wal? и что именно нужно положить в архив, чтобы потом восстановиться целиком — агенты, кроны, hands?",
+    "should_trigger": true
+  },
+  {
+    "query": "my agent forgets what it did about ten tool calls into a long run and starts the whole procedure over from the top. it's a hand agent, workspace is /data/workspaces/youtube-insights. is there a history limit somewhere i can raise, or do i have to restructure the task so it keeps state in a file?",
+    "should_trigger": true
+  },
+  {
+    "query": "дашборд на :4200 показывает пустые списки — ни агентов, ни hands, и в TUI то же самое, всё пусто. при этом curl /api/agents отдаёт три агента и они реально работают, cron отрабатывает. это дашборд сломан или я не туда смотрю?",
+    "should_trigger": true
+  },
+  {
+    "query": "just realised anyone on the tailnet can curl <tailnet-ip>:4200/api/cron/jobs with no credentials and it dumps the full job config including a webhook delivery target that has my bearer token in an auth_header field. how do I lock that down without breaking the local CLI and the nightly job?",
+    "should_trigger": true
+  },
+
+  {
+    "query": "dokploy на <public-ip> задеплоил новый compose-стек, контейнер поднялся и healthy, но traefik отдаёт 502 на поддомене, в логах traefik 'no available server'. похоже лейблы или сеть. с чего начать копать?",
+    "should_trigger": false
+  },
+  {
+    "query": "/var/lib/docker is up to 38GB and df says the root fs is 91% full. what's actually safe to prune here — dangling images, the buildkit cache, stopped containers? I definitely don't want to touch any named volumes because a couple of them hold live data.",
+    "should_trigger": false
+  },
+  {
+    "query": "запускаю claude code по ssh на этом vps, закрываю крышку ноута — и сессия умирает вместе со всей работой. хочу чтобы процесс жил дальше, переживал reboot, и чтобы утром я мог переподключиться и продолжить с того же места",
+    "should_trigger": false
+  },
+  {
+    "query": "i'm writing my own claude code skill at ~/.claude/skills/deploy-notes/SKILL.md and it basically never fires — I have to invoke it by name every time. how do I test whether the frontmatter description actually triggers, and iterate on it properly rather than guessing?",
+    "should_trigger": false
+  },
+  {
+    "query": "for summarising 200-page PDFs, which claude model gives me the best cost per run right now, and does prompt caching actually help if the PDF is different every time? I'm calling it from the python sdk in a batch loop.",
+    "should_trigger": false
+  },
+  {
+    "query": "add a crontab entry on the host that rotates /var/log/nginx/*.log at 3am, keeps 14 days, and emails me at <owner-email> if the rotation exits non-zero. logrotate is installed but I don't think anything is scheduling it.",
+    "should_trigger": false
+  },
+  {
+    "query": "how do I add a stdio MCP server to a project's .mcp.json so claude code picks it up automatically, and scope it to just that repo instead of my user config? the server is a local node script that needs an env var for its token.",
+    "should_trigger": false
+  },
+  {
+    "query": "yt-dlp on my macbook keeps returning HTTP 403 for a members-only video even though I'm logged in in chrome. do I need --cookies-from-browser, or is this the po-token thing everyone's complaining about? version is 2026.07.04.",
+    "should_trigger": false
+  },
+  {
+    "query": "tailscale на этой машине почему-то называется <tailnet-host>, а я везде в скриптах и заметках пишу <host>, и magicdns соответственно не резолвит. как переименовать ноду и ничего не сломать в acl и в уже прописанных хостах?",
+    "should_trigger": false
+  },
+  {
+    "query": "в /root/pre-wipe-backup-2026-08-09 лежит дамп постгреса, снятый до вайпа. надо поднять временный контейнер с postgres 16, восстановить оттуда только одну базу и посмотреть пару таблиц, потом всё снести. как это сделать аккуратно, не задев то, что сейчас крутится на сервере?",
+    "should_trigger": false
+  }
+]

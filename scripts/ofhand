@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+"""ofhand - install, inspect and reconfigure workspace hands the way that sticks.
+
+Three facts make hands easy to get wrong, and all three are handled here:
+
+  * `openfang hand install` and POST /api/hands/{install,upsert} register the
+    hand *in memory only*. It vanishes on the next restart. The one function
+    that writes to disk targets /root/.openfang/hands, which the kernel never
+    reads. The only durable path is a file in $OPENFANG_HOME/hands/<id>/ plus a
+    restart - `ofhand install` does exactly that and then proves it loaded.
+
+  * Deactivating a hand permanently deletes its cron jobs, and
+    PUT /api/hands/{id}/settings never persists. So "change a setting" has to
+    be done by editing hand_state.json and restarting - `ofhand set` does that.
+    There is deliberately no `deactivate` subcommand here.
+
+  * A HAND.toml can be silently wrong in half a dozen ways (provider defaults
+    to Anthropic, a bare `max_iterations` starts an hourly autonomous loop, a
+    non-string setting default is dropped). `ofhand lint` checks for those
+    before you restart anything.
+
+Stdlib only. Run on the host.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+
+HOME_HOST = os.environ.get(
+    "OPENFANG_HOME_HOST", "/var/lib/docker/volumes/openfang_openfang-data/_data"
+)
+BASE_URL = os.environ.get("OPENFANG_URL", "http://127.0.0.1:4200").rstrip("/")
+CONTAINER = os.environ.get("OPENFANG_CONTAINER", "openfang-openfang-1")
+CONFIG = os.environ.get("OPENFANG_CONFIG", os.path.join(HOME_HOST, "config.toml"))
+
+GATED_TOOLS = {"shell_exec", "file_write", "file_delete", "http_request", "agent_spawn"}
+
+
+def die(msg, code=1):
+    sys.stdout.flush()
+    print(f"ofhand: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def api_key():
+    if os.environ.get("OPENFANG_API_KEY"):
+        return os.environ["OPENFANG_API_KEY"]
+    try:
+        with open(CONFIG) as fh:
+            for line in fh:
+                s = line.strip()
+                if s.startswith("["):
+                    break
+                m = re.match(r'api_key\s*=\s*["\'](.*?)["\']\s*$', s)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    die(f"no top-level api_key in {CONFIG} (set OPENFANG_API_KEY)", 2)
+
+
+def request(method, path, body=None, auth=True, timeout=30):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE_URL + path, data=data, method=method)
+    if data:
+        req.add_header("Content-Type", "application/json")
+    if auth:
+        req.add_header("Authorization", "Bearer " + api_key())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, raw.decode("utf-8", "replace")
+    except Exception as e:
+        return 0, str(e)
+
+
+def docker(*args, timeout=120):
+    p = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout + p.stderr
+
+
+def hand_dir(hand_id):
+    return os.path.join(HOME_HOST, "hands", hand_id)
+
+
+# ------------------------------------------------------------------------ lint
+
+def lint_manifest(path):
+    """Return (hand_id, [(level, message), ...]). level is ERROR/WARN/NOTE."""
+    out = []
+    try:
+        with open(path, "rb") as fh:
+            man = tomllib.load(fh)
+    except FileNotFoundError:
+        return None, [("ERROR", f"{path} does not exist")]
+    except tomllib.TOMLDecodeError as e:
+        # A manifest that does not parse is skipped at boot with a log line and
+        # nothing else - the hand just never appears.
+        return None, [("ERROR", f"{path} is not valid TOML: {e}")]
+
+    hand_id = man.get("id")
+    if not hand_id:
+        out.append(("ERROR", "no top-level `id` - the registry keys on it"))
+    dirname = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    if hand_id and dirname not in (hand_id, "") and dirname != "assets":
+        out.append(
+            ("NOTE", f"directory is {dirname!r} but id is {hand_id!r}; install uses the id")
+        )
+    for field in ("name", "description"):
+        if not man.get(field):
+            out.append(("WARN", f"no `{field}` - the dashboard shows an empty card"))
+
+    agent = man.get("agent") or {}
+    if not agent:
+        out.append(("ERROR", "no [agent] table - nothing to activate"))
+    else:
+        for field in ("provider", "model"):
+            val = agent.get(field)
+            if val is None:
+                out.append((
+                    "ERROR",
+                    f"[agent].{field} is missing: omitting it yields anthropic / "
+                    "claude-sonnet-4-20250514 (lib.rs:306-311), not your configured LLM. "
+                    f'Write {field} = "default" literally',
+                ))
+            elif val != "default":
+                out.append((
+                    "WARN",
+                    f'[agent].{field} = {val!r}. Unless you really want to pin this hand to '
+                    f'another provider, write "default" so it follows [default_model]',
+                ))
+        if "max_iterations" in agent:
+            out.append((
+                "WARN",
+                f"[agent].max_iterations = {agent['max_iterations']} flips the hand agent into "
+                "ScheduleMode::Continuous { check_interval_secs: 3600 } (kernel.rs:3835) - it "
+                "wakes and burns tokens every hour on its own. Omit it and drive the hand from "
+                "a cron job instead",
+            ))
+        if "max_history_messages" in agent:
+            out.append((
+                "NOTE",
+                "[agent].max_history_messages is not a HAND.toml field; hand agents stay at the "
+                "20-message default (openfang-types/src/agent.rs:523), roughly 10 tool calls",
+            ))
+        if "autonomous" in man:
+            out.append((
+                "WARN",
+                "[autonomous] pins the agent to a 60 s heartbeat timeout and makes "
+                "[heartbeat] default_timeout_secs a no-op for it (#1252)",
+            ))
+
+    tools = man.get("tools") or []
+    gated = sorted(set(tools) & GATED_TOOLS)
+    if gated:
+        out.append((
+            "NOTE",
+            f"agents tagged hand:* auto-approve every gated tool, so {', '.join(gated)} runs "
+            "without an approval prompt",
+        ))
+    if "shell_exec" in tools:
+        out.append((
+            "NOTE",
+            "declaring shell_exec grants ExecSecurityMode::Full + a 300 s timeout automatically "
+            "(kernel.rs:3845-3854). The metacharacter denylist still applies in every mode: no "
+            "| > < ; & ` $( ${ { } newline or NUL. Ship a script file and call it with flat argv",
+        ))
+
+    for s in man.get("settings") or []:
+        key = s.get("key", "<no key>")
+        if "default" in s and not isinstance(s["default"], str):
+            out.append((
+                "ERROR",
+                f"[[settings]] {key}: default is {type(s['default']).__name__}, not a string. "
+                "resolve_settings reads values with Value::as_str(), so a non-string silently "
+                f'falls back. Write "{s["default"]}"',
+            ))
+        if s.get("setting_type") in ("toggle", "boolean"):
+            out.append((
+                "NOTE",
+                f'[[settings]] {key} is a toggle - its value still has to be sent as "true"/"false"',
+            ))
+
+    install = (man.get("requires") or {}).get("install") if isinstance(man.get("requires"), dict) else None
+    if isinstance(man.get("requires"), list):
+        install = None
+        for r in man["requires"]:
+            if isinstance(r, dict) and isinstance(r.get("install"), dict):
+                install = r["install"]
+    if install and "linux_apt" in install:
+        out.append((
+            "ERROR",
+            "requires.install.linux_apt is tried first on Linux and `sudo` does not exist in the "
+            "container (exit 127). Drop linux_apt and leave the pip entry",
+        ))
+
+    skill = os.path.join(os.path.dirname(os.path.abspath(path)), "SKILL.md")
+    if not os.path.exists(skill):
+        out.append(("NOTE", "no SKILL.md next to HAND.toml (optional, but it is the hand's prompt body)"))
+
+    return hand_id, out
+
+
+def cmd_lint(args):
+    path = args.path
+    if os.path.isdir(path):
+        path = os.path.join(path, "HAND.toml")
+    hand_id, findings = lint_manifest(path)
+    for level, msg in findings:
+        print(f"[{level:5}] {msg}")
+    errors = sum(1 for l, _ in findings if l == "ERROR")
+    warns = sum(1 for l, _ in findings if l == "WARN")
+    print(f"\n{path}: id={hand_id} ERROR={errors} WARN={warns} NOTE={len(findings) - errors - warns}")
+    return 1 if errors else 0
+
+
+# --------------------------------------------------------------------- install
+
+def wait_healthy(deadline_secs=90):
+    start = time.time()
+    while time.time() - start < deadline_secs:
+        code, _ = request("GET", "/api/health", auth=False, timeout=3)
+        if code == 200:
+            return True
+        time.sleep(2)
+    return False
+
+
+def restart_and_confirm(hand_id, dry_run):
+    # Unix seconds, not RFC3339: a naive RFC3339 string is read as *local* time
+    # and this host runs BST, which would silently shift the window by an hour.
+    since = str(int(time.time()) - 2)
+    if dry_run:
+        print(f"  [dry-run] docker restart {CONTAINER}")
+        print(f"  [dry-run] docker logs --since {since} {CONTAINER} | grep 'workspace hand'")
+        print(f"  [dry-run] GET {BASE_URL}/api/hands/{hand_id}")
+        return 0
+    print(f"  docker restart {CONTAINER} ...")
+    rc, out = docker("restart", CONTAINER)
+    if rc != 0:
+        die(f"restart failed: {out.strip()}")
+    if not wait_healthy():
+        die("daemon did not come back healthy within 90 s - check `docker logs`")
+
+    rc, logs = docker("logs", "--since", since, CONTAINER)
+    logs = re.sub(r"\x1b\[[0-9;]*m", "", logs)
+    hit = [l for l in logs.splitlines() if "workspace hand" in l.lower()]
+    for l in hit:
+        print("  " + l.strip())
+    if not any(f"hand={hand_id}" in l for l in hit):
+        print(
+            f"  ! no 'Loaded workspace hand hand={hand_id}' line. The manifest probably failed to "
+            f"parse - run `ofhand lint {hand_dir(hand_id)}` and read `docker logs {CONTAINER}`",
+            file=sys.stderr,
+        )
+        return 1
+    code, _ = request("GET", f"/api/hands/{hand_id}", auth=False)
+    print(f"  GET /api/hands/{hand_id} -> {code}")
+    return 0 if code == 200 else 1
+
+
+def cmd_install(args):
+    src = args.source
+    if os.path.isfile(src):
+        src = os.path.dirname(os.path.abspath(src))
+    manifest = os.path.join(src, "HAND.toml")
+    hand_id, findings = lint_manifest(manifest)
+    errors = [m for l, m in findings if l == "ERROR"]
+    for level, msg in findings:
+        if level != "NOTE" or args.verbose:
+            print(f"[{level:5}] {msg}")
+    if errors and not args.force:
+        die(f"{len(errors)} lint error(s); fix them or pass --force")
+
+    hand_id = args.id or hand_id
+    if not hand_id:
+        die("no id in HAND.toml and no --id given")
+    dest = hand_dir(hand_id)
+
+    files = [f for f in ("HAND.toml", "SKILL.md") if os.path.exists(os.path.join(src, f))]
+    print(f"\ninstall {hand_id}: {src} -> {dest}  ({', '.join(files)})")
+    if args.dry_run:
+        print(f"  [dry-run] mkdir -p {dest}")
+        for f in files:
+            print(f"  [dry-run] cp {os.path.join(src, f)} {dest}/")
+    else:
+        os.makedirs(dest, exist_ok=True)
+        for f in files:
+            shutil.copy2(os.path.join(src, f), os.path.join(dest, f))
+            print(f"  copied {f}")
+
+    if args.no_restart:
+        print(
+            "  --no-restart: the file is on disk but the registry only reads hands/ at boot, "
+            f"so the running daemon still has the old definition. `docker restart {CONTAINER}` "
+            "when you are ready."
+        )
+        return 0
+    return restart_and_confirm(hand_id, args.dry_run)
+
+
+# -------------------------------------------------------------------- activate
+
+def kv_pairs(items):
+    """k=v strings -> {k: "v"}. Every value is a JSON string on purpose:
+    resolve_settings reads with Value::as_str(), so 3 or true silently reverts
+    to the manifest default."""
+    cfg = {}
+    for item in items:
+        if "=" not in item:
+            die(f"setting {item!r} is not key=value")
+        k, v = item.split("=", 1)
+        cfg[k.strip()] = str(v)
+    return cfg
+
+
+def cmd_activate(args):
+    cfg = kv_pairs(args.settings)
+    body = {"config": cfg}
+    print(f"POST /api/hands/{args.id}/activate  {json.dumps(body)}")
+    if args.dry_run:
+        print("[dry-run] not sent")
+        return 0
+    code, resp = request("POST", f"/api/hands/{args.id}/activate", body)
+    print(json.dumps(resp, indent=2) if isinstance(resp, (dict, list)) else resp)
+    if code != 200:
+        print(f"ofhand: HTTP {code}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# ------------------------------------------------------------------------- set
+
+def cmd_set(args):
+    """Change an active hand's config the only way that survives and keeps cron jobs.
+
+    PUT /api/hands/{id}/settings only touches the in-memory registry
+    (routes.rs:4948-4987): it never calls persist_hand_state and never rebuilds
+    the agent's prompt. Deactivate+reactivate does persist - and permanently
+    deletes the hand's cron jobs. So: edit hand_state.json, restart, and let the
+    boot path replay activate_hand(hand_id, config, None) (kernel.rs:4391-4397).
+    The agent uuid is uuid5(NAMESPACE_DNS, hand_id), so it does not change and
+    cron jobs keep pointing at it.
+    """
+    state_path = os.path.join(HOME_HOST, "hand_state.json")
+    try:
+        with open(state_path) as fh:
+            state = json.load(fh)
+    except Exception as e:
+        die(f"cannot read {state_path}: {e}")
+
+    matches = [i for i in state if i.get("hand_id") == args.id]
+    if not matches:
+        die(f"no active instance of {args.id!r} in {state_path} "
+            f"(active: {', '.join(sorted({i.get('hand_id', '?') for i in state})) or 'none'}). "
+            f"Use `ofhand activate {args.id} k=v` first")
+    if len(matches) > 1:
+        print(f"! {len(matches)} instances of {args.id}; editing the first (DashMap order)",
+              file=sys.stderr)
+    inst = matches[0]
+    before = dict(inst.get("config") or {})
+    after = dict(before)
+    after.update(kv_pairs(args.settings))
+
+    print(f"{state_path}  hand={args.id} agent={inst.get('agent_id')}")
+    for k in sorted(set(before) | set(after)):
+        if before.get(k) != after.get(k):
+            print(f"  {k}: {before.get(k)!r} -> {after.get(k)!r}")
+        elif args.verbose:
+            print(f"  {k}: {after.get(k)!r} (unchanged)")
+    if before == after:
+        print("  nothing to change")
+        return 0
+
+    if args.dry_run:
+        print(f"  [dry-run] write {state_path}, then docker restart {CONTAINER}")
+        return 0
+
+    inst["config"] = after
+    backup = state_path + ".bak"
+    shutil.copy2(state_path, backup)
+    with open(state_path, "w") as fh:
+        json.dump(state, fh, indent=2)
+    print(f"  written (previous copy at {backup})")
+
+    # Unix seconds, not RFC3339: a naive RFC3339 string is read as *local* time
+    # and this host runs BST, which would silently shift the window by an hour.
+    since = str(int(time.time()) - 2)
+    rc, out = docker("restart", CONTAINER)
+    if rc != 0:
+        die(f"restart failed: {out.strip()}")
+    if not wait_healthy():
+        die("daemon did not come back healthy within 90 s")
+    rc, logs = docker("logs", "--since", since, CONTAINER)
+    logs = re.sub(r"\x1b\[[0-9;]*m", "", logs)
+    for l in logs.splitlines():
+        if "hand restored" in l.lower() or "failed to restore hand" in l.lower():
+            print("  " + l.strip())
+    return 0
+
+
+# ------------------------------------------------------------------------ list
+
+def cmd_list(args):
+    code, data = request("GET", "/api/hands", auth=False)
+    registry = {h.get("id"): h for h in (data or {}).get("hands", [])} if code == 200 else {}
+    hands_root = os.path.join(HOME_HOST, "hands")
+    on_disk = set()
+    if os.path.isdir(hands_root):
+        on_disk = {
+            d for d in os.listdir(hands_root)
+            if os.path.isfile(os.path.join(hands_root, d, "HAND.toml"))
+        }
+    try:
+        with open(os.path.join(HOME_HOST, "hand_state.json")) as fh:
+            state = json.load(fh)
+    except Exception:
+        state = []
+    active = {i.get("hand_id"): i for i in state}
+
+    print(f"{'HAND':24} {'SOURCE':10} {'ACTIVE':8} AGENT / CONFIG")
+    for hid in sorted(set(registry) | on_disk):
+        source = "workspace" if hid in on_disk else "bundled"
+        if hid in on_disk and hid not in registry:
+            source = "ON DISK, NOT LOADED"
+        inst = active.get(hid)
+        tail = ""
+        if inst:
+            tail = inst.get("agent_id", "") + "  " + json.dumps(inst.get("config") or {})
+        print(f"{hid:24} {source:10} {'yes' if inst else '-':8} {tail}")
+    stale = on_disk - set(registry)
+    if stale:
+        print(f"\n! {', '.join(sorted(stale))} exist on disk but are not in the registry - "
+              f"the loader only reads hands/ at boot. docker restart {CONTAINER}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ofhand",
+        description="Install, inspect and reconfigure OpenFang workspace hands.",
+        epilog=(
+            "There is no `deactivate` on purpose: deactivating a hand permanently deletes its "
+            "cron jobs. Use `ofhand set` to change an active hand's configuration."
+        ),
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("lint", help="check a HAND.toml against the traps that bite silently")
+    p.add_argument("path", help="directory containing HAND.toml, or the file itself")
+    p.set_defaults(fn=cmd_lint)
+
+    p = sub.add_parser("install", help="copy into $OPENFANG_HOME/hands/<id>/, restart, prove it loaded")
+    p.add_argument("source", help="directory containing HAND.toml (+ optional SKILL.md)")
+    p.add_argument("--id", help="override the id from the manifest")
+    p.add_argument("--no-restart", action="store_true", help="copy only; the daemon keeps the old definition")
+    p.add_argument("--force", action="store_true", help="install even with lint errors")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(fn=cmd_install)
+
+    p = sub.add_parser("activate", help="activate a hand with config (values sent as JSON strings)")
+    p.add_argument("id")
+    p.add_argument("settings", nargs="*", metavar="key=value")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_activate)
+
+    p = sub.add_parser("set", help="change an active hand's config via hand_state.json + restart")
+    p.add_argument("id")
+    p.add_argument("settings", nargs="+", metavar="key=value")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(fn=cmd_set)
+
+    p = sub.add_parser("list", help="disk vs registry vs active instances")
+    p.set_defaults(fn=cmd_list)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

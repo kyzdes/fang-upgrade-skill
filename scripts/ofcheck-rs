@@ -1,0 +1,58 @@
+#!/bin/sh
+# ofcheck-rs <путь-к-worktree> [крейт...] — cargo check в контейнере, rust на хосте не нужен.
+#
+# У КАЖДОГО worktree СВОЙ том с целью сборки, и это не перестраховка. Первая версия
+# использовала один общий CARGO_TARGET_DIR на все worktree: внутри контейнера все они
+# монтируются по одному пути /build, чтобы cargo переиспользовал отпечатки, которые
+# считаются по путям. Но отпечатки у cargo завязаны ещё и на mtime, поэтому проверка
+# пропатченного дерева переиспользовала артефакт, собранный из ДРУГОЙ копии того же
+# /build, и возвращала чужой результат. Молча — что хуже всего: патч выглядел сломанным,
+# хотя сломан был инструмент.
+#
+# Цена изоляции — первая проверка каждого worktree идёт с нуля (~4.5 мин). Дальше
+# инкрементально. Реестр пакетов остаётся общим: он только читается, и cargo защищает
+# его файловой блокировкой.
+set -eu
+
+WT=$1; shift
+[ -d "$WT" ] || { echo "нет каталога: $WT" >&2; exit 2; }
+
+# имя тома по basename worktree; несловарные символы в имени тома docker не любит
+SLUG=$(basename "$WT" | tr -c 'a-zA-Z0-9_.-' '-')
+TGT="fang-target-$SLUG"
+
+# Изоляция стоит места: одна цель сборки этого проекта — 5-12 ГБ, и на девяти worktree
+# они забили 77-гиговый диск досуха. Отказ был не в коде: cargo падал с "No space left on
+# device" посреди clippy, и это легко принять за дефект патча.
+#
+# Поэтому проверяем ДО запуска. Тома влитых патчей удаляются вручную:
+#   docker volume rm fang-target-<slug>
+FREE_G=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+USED_G=$(docker volume ls -q | grep '^fang-target' \
+         | xargs -r -I{} du -sBG /var/lib/docker/volumes/{}/_data 2>/dev/null \
+         | awk '{s+=$1} END {print s+0}')
+if [ "${FREE_G:-0}" -lt 12 ]; then
+    echo "ofcheck-rs: свободно ${FREE_G}G, целям сборки нужно ~12G на worktree." >&2
+    echo "  сейчас под fang-target-* занято ${USED_G}G в $(docker volume ls -q | grep -c '^fang-target') томах." >&2
+    echo "  удали тома влитых патчей: docker volume rm fang-target-<slug>" >&2
+    exit 3
+fi
+[ "${FREE_G:-0}" -lt 25 ] && echo "ofcheck-rs: свободно всего ${FREE_G}G (цели сборки занимают ${USED_G}G)" >&2
+
+docker volume create "$TGT" >/dev/null
+docker volume create fang-cargo-registry >/dev/null
+
+ARGS=""
+for c in "$@"; do ARGS="$ARGS -p $c"; done
+[ -n "$ARGS" ] || ARGS="--workspace"
+
+echo "# worktree $WT → том $TGT" >&2
+exec docker run --rm \
+  -v "$WT":/build:ro \
+  -v "$TGT":/target \
+  -v fang-cargo-registry:/usr/local/cargo/registry \
+  -w /build \
+  -e CARGO_TARGET_DIR=/target \
+  -e CARGO_TERM_COLOR=never \
+  rust:1-slim-bookworm \
+  sh -c "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq pkg-config libssl-dev perl make >/dev/null 2>&1; cargo check $ARGS 2>&1 | tail -40"

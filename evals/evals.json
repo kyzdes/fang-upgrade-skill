@@ -1,0 +1,117 @@
+{
+  "skill_name": "openfang",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "We have an OpenFang agent (UUID 7c1f2e3a-9b4d-4a2e-8f10-1234567890ab) that runs a nightly digest procedure. Set it up so it fires once a day at 3:00 AM Europe/Berlin time and appends its output to /data/out/log.md. I don't want it burning tokens more often than that — give me the exact commands.",
+      "expected_output": "Creates a cron job through the HTTP API — POST http://127.0.0.1:4200/api/cron/jobs with Authorization: Bearer $K — using {\"schedule\":{\"kind\":\"cron\",\"expr\":\"0 3 * * *\",\"tz\":\"Europe/Berlin\"}}, an action of kind agent_turn with an explicit timeout_secs (<=600), delivery kind none plus a delivery_targets entry of type local_file pointing at /data/out/log.md with append:true, and one_shot:false. Explicitly avoids putting a `[schedule] periodic = { cron = ... }` block in the agent manifest, and if it explains why, says that periodic only understands `every <N>s|m|h|d` and a real cron expression there silently becomes a 300-second interval. If it enables/disables the job it uses PUT .../enable with a JSON body ({\"enabled\":true} or false), not POST .../enable or a DELETE-style /disable route. Does not place any secret (API key, bearer token) inside delivery_targets given that GET /api/cron/jobs is public and returns delivery_targets verbatim.",
+      "files": [],
+      "assertions": [
+        {
+          "name": "used_cron_job_api_not_periodic_schedule",
+          "check": "The nightly run is created through the cron-job API, either as a POST to /api/cron/jobs whose JSON body contains \"kind\":\"cron\" and \"expr\":\"0 3 * * *\", or as the bundled wrapper `ofcron create ... --cron \"0 3 * * *\" --tz Europe/Berlin` (scripts/ofcron builds exactly that body). The transcript does NOT use `[schedule] periodic` as the mechanism for the nightly run."
+        },
+        {
+          "name": "flagged_periodic_300s_trap",
+          "check": "If the response discusses the [schedule] periodic option at all (e.g. to reject it), it states that periodic only supports 'every <N>s|m|h|d' and that a cron expression there degrades to a 300-second interval — not left unmentioned or described as a viable alternative."
+        },
+        {
+          "name": "action_includes_explicit_timeout",
+          "check": "The timeout is set explicitly and is <= 600: either the JSON body's \"action\" object carries a \"timeout_secs\" key, or `ofcron create` is invoked with `--timeout <=600` (ofcron defaults to 600 and always emits the field). Omitting it entirely fails this check, because the API default of 120 s kills a real procedure mid-flight."
+        },
+        {
+          "name": "enable_disable_uses_put_with_body",
+          "check": "Any enable or disable operation uses PUT http://127.0.0.1:4200/api/cron/jobs/<id>/enable with a JSON body such as {\"enabled\":true} / {\"enabled\":false}, or the `ofcron enable <id>` / `ofcron disable <id>` wrapper, which issues that exact PUT. A bare POST .../enable or a .../disable route presented as the way to toggle the job fails this check."
+        },
+        {
+          "name": "no_secret_placed_in_delivery_target",
+          "check": "delivery_targets in the produced job body contains no Authorization header, bearer token, or API key value (no 'auth_header' field carrying 'Bearer <token>'); local_file delivery (or `ofcron --file`, which emits a local_file target and has no flag for an auth header) is used instead. GET /api/cron/* is public and echoes delivery_targets verbatim."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I wrote a new hand called 'digest' — HAND.toml and SKILL.md are sitting in ~/work/digest-hand on the host. Get it installed and activated on the openfang-openfang-1 box so it keeps running even if the container gets restarted or crashes overnight.",
+      "expected_output": "Copies HAND.toml and SKILL.md into $OPENFANG_HOME/hands/digest on disk — i.e. mkdir -p /var/lib/docker/volumes/openfang_openfang-data/_data/hands/digest && cp HAND.toml SKILL.md into it (equivalently /data/hands/digest inside the container) — then runs `docker restart openfang-openfang-1`, then confirms the hand loaded (docker logs grep for 'workspace hand', or GET /api/hands showing 'digest'), then activates it with POST http://127.0.0.1:4200/api/hands/digest/activate using the daemon api_key and any settings passed as JSON strings. It explicitly does NOT rely on `openfang hand install` or POST/PUT /api/hands/{install,upsert} as the persistence mechanism — if those are used at all, it's only for fast iteration before the file copy, with a clear statement that they register in memory only and vanish on restart (and that the CLI's on-disk write target /root/.openfang/hands is never read by the kernel).",
+      "files": [],
+      "assertions": [
+        {
+          "name": "copied_hand_files_to_data_hands_dir",
+          "check": "HAND.toml (and SKILL.md) end up under $OPENFANG_HOME/hands/digest — a path containing \"/hands/digest\" rooted at /data or /var/lib/docker/volumes/openfang_openfang-data/_data — placed either by an explicit copy or by `ofhand install <dir>`, which performs that copy. Registering only via an API/CLI call, or writing to /root/.openfang/hands, fails this check. A bare `docker cp <srcdir> openfang-openfang-1:/data/hands/digest` also fails when the destination already exists, because it nests the source one level deeper; the trailing \"/.\" form is required."
+        },
+        {
+          "name": "restarted_container_after_file_copy",
+          "check": "The container is restarted after the file copy, as the step that makes the kernel load the new hand directory: either an explicit `docker restart openfang-openfang-1` or `ofhand install`, which restarts as part of its sequence."
+        },
+        {
+          "name": "did_not_present_hand_install_as_durable",
+          "check": "The response does not claim that `openfang hand install <path>` or POST/PUT /api/hands/{install,upsert} alone makes the hand survive a restart; if these commands appear, the text around them says explicitly that they are memory-only / lost on restart."
+        },
+        {
+          "name": "activated_via_activate_endpoint_with_string_settings",
+          "check": "Activation goes through POST /api/hands/digest/activate with a JSON body whose \"config\" values (if any) are JSON strings (e.g. \"3\", not 3), or through `ofhand activate digest key=value`, which quotes every value. A bare number or boolean in the config object fails this check, because setting resolution is config.get(key).and_then(|v| v.as_str()) and a non-string silently reverts to the default."
+        },
+        {
+          "name": "verified_load_before_declaring_done",
+          "check": "Before concluding the hand is installed, the load is confirmed — `docker logs ... | grep -i \"workspace hand\"` for `Loaded workspace hand hand=digest`, a GET of /api/hands, or `ofhand install`, which performs both checks itself and fails loudly if neither passes. Stopping at copy + restart without any confirmation fails this check."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "I need an OpenFang agent to grab auto-generated captions for a video with yt-dlp, filter out just the lines that look like errors, and save those to /data/out/errors.txt — all through shell_exec. My draft command is: `yt-dlp --write-auto-subs $URL 2>&1 | grep ERROR > /data/out/errors.txt`. If that gets rejected, just crank exec_policy up to full mode so pipes and redirects are allowed.",
+      "expected_output": "States clearly that shell_exec is not a real shell in any exec_policy mode — pipe (|), redirection (>, <), &&, backticks, $(...), semicolons, and the other rejected metacharacters are stripped before the exec-policy check even runs, so raising the mode to full will not unlock pipes or redirection. Restructures the task using the documented escape hatch: write a script file (e.g. a small Python or shell script written via file_write) that performs the yt-dlp call and the ERROR filtering internally, then invoke that script as flat argv via shell_exec with no shell metacharacters in the shell_exec argument list — or equivalently issue separate shell_exec calls with a plain file in between (no > or | connecting them). Does not deliver a solution whose shell_exec argument string contains any of ` $( ${ ; | > < { } & or backticks.",
+      "files": [],
+      "assertions": [
+        {
+          "name": "no_shell_metacharacters_in_final_shell_exec_call",
+          "check": "Scan every shell_exec argument/command string in the final proposed solution for the characters | > < & ; ` $( ${ — none should appear connecting two commands (a literal '&' inside a URL query string, if unavoidable, would still be flagged as rejected and is not presented as working)."
+        },
+        {
+          "name": "explicitly_rejects_full_mode_as_a_fix",
+          "check": "The response states, rather than omits, that switching exec_policy to 'full' does not enable pipes/redirection because metacharacter rejection happens before the exec-policy check is applied."
+        },
+        {
+          "name": "uses_script_file_escape_hatch",
+          "check": "The solution includes writing a script file (via file_write or equivalent) containing the yt-dlp + filtering logic, and invoking that script through shell_exec as a single flat argv entry (e.g. ['/data/workspace/run.sh'] or ['python3','/data/workspace/filter.py']) rather than trying to pass shell syntax directly."
+        },
+        {
+          "name": "captions_use_yt_dlp_without_video_download",
+          "check": "The script/commands shown fetch captions/auto-subs (e.g. --write-auto-subs --skip-download or --write-auto-subs --skip-download and no plain download flags) rather than downloading the full video, consistent with the caption-only intake pattern documented for this box."
+        },
+        {
+          "name": "does_not_claim_pipe_worked_after_retry",
+          "check": "No part of the transcript claims the original piped/redirected command succeeded after any adjustment short of removing the shell metacharacters entirely (e.g. no claim that quoting, escaping, or a different exec_policy value alone fixed it)."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "I want to point OpenFang at a self-hosted OpenAI-protocol-compatible endpoint at http://localhost:8080/v1 and use the model 'llama-3.1-70b' through it with a real 128000-token context window (not a guessed one). I was going to name the provider 'openai' since it speaks the OpenAI protocol — that seems like the obvious name. Walk me through registering it.",
+      "expected_output": "Registers the model via POST http://127.0.0.1:4200/api/models/custom with an id like 'localllm/llama-3.1-70b', \"provider\":\"localllm\" (or another non-'openai' name), context_window 128000, plus max_output_tokens and real input_cost_per_m/output_cost_per_m instead of leaving them to be fabricated. Separately registers the provider's base_url via PUT http://127.0.0.1:4200/api/providers/localllm/url with {\"base_url\":\"http://localhost:8080/v1\"} — calling out that skipping this second call leaves the provider invisible even though the model call succeeded. Explicitly warns against naming the provider 'openai', citing that strip_provider_prefix builds \"{provider}/\" at runtime and truncates any model id starting with that prefix, silently and persistently — this box is only safe because its provider is named something other than a real driver prefix, and renaming to 'openai' would trigger that truncation bug (#1195). If a provider API key needs to be set, uses PUT .../key (or equivalent) with body {\"key\": \"...\"}, not {\"api_key\": \"...\"}.",
+      "files": [],
+      "assertions": [
+        {
+          "name": "registered_both_model_and_provider_url",
+          "check": "Transcript contains both a POST to /api/models/custom (with context_window 128000 and non-zero/non-placeholder cost fields) AND a separate PUT to /api/providers/<name>/url carrying base_url http://localhost:8080/v1 — not just one of the two calls."
+        },
+        {
+          "name": "provider_named_something_other_than_openai",
+          "check": "The provider name used in the actual API calls (the \"provider\" field in the /api/models/custom body and the path segment in /api/providers/<name>/url) is not the literal string 'openai'."
+        },
+        {
+          "name": "explicitly_warns_against_openai_provider_name",
+          "check": "The response contains an explicit statement advising against naming the provider 'openai', tied to the model-id prefix truncation behavior (strip_provider_prefix / issue #1195) rather than silence on the user's suggestion or a generic 'sure, that works' response."
+        },
+        {
+          "name": "correct_key_field_if_key_is_set",
+          "check": "If the response sets a provider API key via any endpoint, the JSON body uses the field name \"key\", not \"api_key\" (a body using \"api_key\" would be flagged as wrong since that returns 400 on this box)."
+        },
+        {
+          "name": "does_not_trust_fabricated_pricing_or_window",
+          "check": "The response does not state or imply that an uncatalogued/custom model will get a correct context window or price automatically without the /api/models/custom registration — it should note or avoid the failure mode where an uncatalogued model gets a fabricated $1/$3-per-M price and a 200000-token assumed window."
+        }
+      ]
+    }
+  ]
+}

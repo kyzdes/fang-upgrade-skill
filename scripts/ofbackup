@@ -1,0 +1,175 @@
+#!/bin/sh
+# ofbackup - consistent backup and restore of an OpenFang instance.
+#
+# The substrate is SQLite in WAL mode, so `cp openfang.db` while the daemon is
+# running can hand you a torn file: the committed tail lives in the -wal
+# sibling. The container has no sqlite3 binary, but it does have the python3
+# sqlite3 *module*, and Connection.backup() takes a consistent snapshot with no
+# downtime. That, plus a tarball of everything else in $OPENFANG_HOME that is
+# not reconstructible, is what this script produces.
+#
+# What a restore cannot bring back, whatever you do: triggers and workflow runs
+# are memory-only. Cron jobs, hands, agents and sessions do come back.
+#
+# The output contains secrets.env and config.toml, so everything is written 0600.
+# POSIX sh; needs docker, tar, python3.
+set -eu
+
+HOME_HOST=${OPENFANG_HOME_HOST:-/var/lib/docker/volumes/openfang_openfang-data/_data}
+CONTAINER=${OPENFANG_CONTAINER:-openfang-openfang-1}
+HOME_CTR=${OPENFANG_HOME_CTR:-/data}
+
+# Everything here is either irreplaceable or expensive to rebuild by hand.
+# Anything absent is skipped silently - this box has no workflows/ dir.
+STATE_ITEMS="config.toml secrets.env cron_jobs.json custom_models.json hand_state.json daemon.json hands workspaces workflows agents"
+
+usage() {
+    cat <<'EOF'
+ofbackup - consistent backup / restore for OpenFang
+
+USAGE
+  ofbackup create [DIR]        snapshot into DIR (default ./openfang-backups)
+  ofbackup verify SNAPSHOT     integrity-check a snapshot directory or .db file
+  ofbackup restore SNAPSHOT    print the restore plan; add --yes to carry it out
+  ofbackup --help
+
+WHAT create PRODUCES
+  DIR/openfang-<UTC timestamp>/
+    openfang.db     consistent snapshot via SQLite's backup API (no downtime,
+                    no torn WAL) - contains agents, sessions, memory, audit chain
+    state.tgz       config.toml secrets.env cron_jobs.json custom_models.json
+                    hand_state.json daemon.json hands/ workspaces/ (+ workflows/,
+                    agents/ when they exist)
+    MANIFEST.txt    sizes, table count, PRAGMA user_version, integrity_check
+
+RESTORE, in short
+  stop the container, drop the files back into $OPENFANG_HOME, put the DB at
+  data/openfang.db with NO stale -wal / -shm siblings next to it, start.
+  Stale siblings are the classic way to resurrect a half-written transaction on
+  top of a good snapshot.
+
+ENVIRONMENT
+  OPENFANG_HOME_HOST  default /var/lib/docker/volumes/openfang_openfang-data/_data
+  OPENFANG_CONTAINER  default openfang-openfang-1
+EOF
+}
+
+sqlite_report() { # $1 = path to a .db on the host
+    python3 - "$1" <<'PY'
+import sqlite3, sys
+db = sys.argv[1]
+try:
+    c = sqlite3.connect(db)
+    integrity = c.execute("PRAGMA integrity_check").fetchone()[0]
+except sqlite3.DatabaseError as e:
+    print(f"integrity_check : UNREADABLE - {e}")
+    sys.exit(1)
+uv = c.execute("PRAGMA user_version").fetchone()[0]
+tables = [r[0] for r in c.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+print(f"integrity_check : {integrity}")
+print(f"user_version    : {uv}")
+print(f"tables          : {len(tables)}")
+print("                  " + ", ".join(tables))
+c.close()
+sys.exit(0 if integrity == "ok" else 1)
+PY
+}
+
+cmd_create() {
+    dest_root=${1:-./openfang-backups}
+    stamp=$(date -u +%Y%m%d-%H%M%SZ)
+    dest=$dest_root/openfang-$stamp
+    mkdir -p "$dest"; chmod 700 "$dest"
+
+    echo "snapshotting $CONTAINER:$HOME_CTR/data/openfang.db (SQLite backup API, no downtime)"
+    tmp_ctr=/tmp/ofbackup-$stamp.db
+    docker exec "$CONTAINER" python3 -c "
+import sqlite3, sys
+src = sqlite3.connect('file:$HOME_CTR/data/openfang.db?mode=ro', uri=True)
+dst = sqlite3.connect('$tmp_ctr')
+src.backup(dst); dst.close(); src.close()
+" || { echo "ofbackup: snapshot failed" >&2; exit 1; }
+    docker cp "$CONTAINER:$tmp_ctr" "$dest/openfang.db" >/dev/null
+    docker exec "$CONTAINER" rm -f "$tmp_ctr" || true
+    chmod 600 "$dest/openfang.db"
+
+    echo "archiving state from $HOME_HOST"
+    items=''
+    for i in $STATE_ITEMS; do
+        [ -e "$HOME_HOST/$i" ] && items="$items $i"
+    done
+    # shellcheck disable=SC2086
+    tar czf "$dest/state.tgz" -C "$HOME_HOST" $items
+    chmod 600 "$dest/state.tgz"
+
+    {
+        echo "OpenFang backup $stamp"
+        echo "source     : $CONTAINER  $HOME_HOST"
+        echo "openfang.db: $(wc -c < "$dest/openfang.db") bytes"
+        echo "state.tgz  :$items"
+        echo "           : $(wc -c < "$dest/state.tgz") bytes"
+        echo
+        sqlite_report "$dest/openfang.db"
+        echo
+        echo "NOT captured (memory-only, never restorable): triggers, workflow runs."
+        echo "Contains secrets.env and config.toml in clear - keep this directory at 0700."
+    } > "$dest/MANIFEST.txt"
+    chmod 600 "$dest/MANIFEST.txt"
+
+    cat "$dest/MANIFEST.txt"
+    echo
+    echo "-> $dest"
+}
+
+cmd_verify() {
+    target=${1:?usage: ofbackup verify SNAPSHOT}
+    [ -d "$target" ] && target="$target/openfang.db"
+    [ -f "$target" ] || { echo "ofbackup: no such snapshot: $target" >&2; exit 1; }
+    echo "$target"
+    sqlite_report "$target"
+}
+
+cmd_restore() {
+    snap=${1:?usage: ofbackup restore SNAPSHOT [--yes]}
+    shift || true
+    confirm=''
+    for a in "$@"; do [ "$a" = "--yes" ] && confirm=1; done
+    [ -d "$snap" ] || { echo "ofbackup: $snap is not a snapshot directory" >&2; exit 1; }
+    [ -f "$snap/openfang.db" ] || { echo "ofbackup: $snap/openfang.db missing" >&2; exit 1; }
+
+    echo "restore plan  $snap -> $HOME_HOST  (container $CONTAINER)"
+    echo "  1. docker stop $CONTAINER"
+    echo "  2. tar xzf $snap/state.tgz -C $HOME_HOST"
+    echo "  3. cp $snap/openfang.db $HOME_HOST/data/openfang.db"
+    echo "  4. rm -f $HOME_HOST/data/openfang.db-wal $HOME_HOST/data/openfang.db-shm"
+    echo "     (a stale -wal replays a half-written transaction over your good snapshot)"
+    echo "  5. chmod 600 $HOME_HOST/config.toml $HOME_HOST/secrets.env"
+    echo "  6. docker start $CONTAINER"
+    echo "  triggers and workflow runs do not come back - they never persisted."
+    if [ -z "$confirm" ]; then
+        echo
+        echo "dry run. Re-run with --yes to execute."
+        return 0
+    fi
+
+    echo; echo "executing"
+    sqlite_report "$snap/openfang.db" >/dev/null || {
+        echo "ofbackup: snapshot fails integrity_check, refusing to restore it" >&2; exit 1; }
+    docker stop "$CONTAINER"
+    tar xzf "$snap/state.tgz" -C "$HOME_HOST"
+    mkdir -p "$HOME_HOST/data"
+    cp "$snap/openfang.db" "$HOME_HOST/data/openfang.db"
+    rm -f "$HOME_HOST/data/openfang.db-wal" "$HOME_HOST/data/openfang.db-shm"
+    chmod 600 "$HOME_HOST/config.toml" "$HOME_HOST/secrets.env" 2>/dev/null || true
+    docker start "$CONTAINER"
+    echo "started. Confirm with: ofdoctor"
+}
+
+case ${1:-} in
+    -h|--help|'') usage; [ -z "${1:-}" ] && exit 64 || exit 0 ;;
+    create) shift; cmd_create "$@" ;;
+    verify) shift; cmd_verify "$@" ;;
+    restore) shift; cmd_restore "$@" ;;
+    *) echo "ofbackup: unknown subcommand '$1' (try --help)" >&2; exit 64 ;;
+esac

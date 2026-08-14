@@ -1,0 +1,173 @@
+#!/bin/sh
+# ofctl - authenticated one-liner for the OpenFang HTTP API.
+#
+# Replaces the `K=$(grep ...config.toml); curl -H "Authorization: Bearer $K" ...`
+# dance. Three reasons it exists rather than being retyped each time:
+#   1. `grep '^api_key'` also matches `api_key_env` and yields a 71-char string
+#      that fails every request with HTTP 400 and an empty body. This script
+#      reads the *top-level* api_key with awk (stops at the first [table]), so
+#      it stays correct even if config.toml is reordered.
+#   2. The key never reaches argv, so it cannot be read out of `ps` or a shell
+#      history file - it goes to curl through a 0600 --config file.
+#   3. Non-2xx becomes a non-zero exit with a readable diagnostic instead of a
+#      silent empty body.
+#
+# POSIX sh; needs only curl + python3 (both on the host; neither in the container).
+set -eu
+
+OF_URL=${OPENFANG_URL:-http://127.0.0.1:4200}
+OF_CONFIG=${OPENFANG_CONFIG:-/var/lib/docker/volumes/openfang_openfang-data/_data/config.toml}
+
+usage() {
+    cat <<'EOF'
+ofctl - authenticated OpenFang API calls
+
+USAGE
+  ofctl [options] METHOD PATH [BODY]
+
+  METHOD  GET | POST | PUT | DELETE | ...
+  PATH    /api/... (leading slash required)
+  BODY    inline JSON, @file, or - for stdin. Sets Content-Type: application/json.
+
+OPTIONS
+  -x, --extract PATH   print one value from the JSON response instead of the whole
+                       body. Dotted path with integer indices: workflow_id,
+                       jobs.0.id, providers.3.base_url
+  -r, --raw            do not pretty-print the response
+  -s, --status         print only the HTTP status code (body suppressed)
+  -n, --no-auth        send no Authorization header - use it to prove whether a
+                       route is really public, e.g. the /api/cron/* exposure
+  -t, --timeout SECS   default 30. Workflow /run blocks for the whole run: use 900
+  -u, --url BASE       default $OPENFANG_URL or http://127.0.0.1:4200
+      --show-key-source  print where the key is read from (never the key itself)
+  -h, --help
+
+EXIT
+  0 = 2xx   1 = HTTP >= 400 (body still on stdout, diagnostic on stderr)   2 = no response
+
+EXAMPLES
+  ofctl GET /api/agents
+  ofctl -x total GET /api/models
+  ofctl POST /api/agents/$AID/message '{"message":"Reply with exactly: PONG"}'
+  ofctl PUT  /api/cron/jobs/$JID/enable '{"enabled":true}'
+  ofctl -x workflow_id POST /api/workflows @wf.json
+  ofctl -t 900 POST /api/workflows/$WFID/run '{"input":"..."}'
+  ofctl -s -n GET /api/cron/jobs        # 200 => served with no credential
+
+ENVIRONMENT
+  OPENFANG_API_KEY  use this key instead of reading config.toml
+  OPENFANG_URL      base URL (Tailscale: http://<tailnet-ip>:4200)
+  OPENFANG_CONFIG   path to config.toml on the host
+EOF
+}
+
+extract=''; raw=''; status_only=''; noauth=''; timeout=30; keysrc=''
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -x|--extract) extract=${2:?--extract needs a path}; shift 2 ;;
+        -r|--raw) raw=1; shift ;;
+        -s|--status) status_only=1; shift ;;
+        -n|--no-auth) noauth=1; shift ;;
+        -t|--timeout) timeout=${2:?--timeout needs seconds}; shift 2 ;;
+        -u|--url) OF_URL=${2:?--url needs a base URL}; shift 2 ;;
+        --show-key-source) keysrc=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) echo "ofctl: unknown option $1 (try --help)" >&2; exit 64 ;;
+        *) break ;;
+    esac
+done
+
+read_key() {
+    if [ -n "${OPENFANG_API_KEY:-}" ]; then
+        printf '%s' "$OPENFANG_API_KEY"
+        return 0
+    fi
+    [ -r "$OF_CONFIG" ] || { echo "ofctl: cannot read $OF_CONFIG (set OPENFANG_API_KEY or OPENFANG_CONFIG)" >&2; exit 2; }
+    # Top-level api_key only: bail out at the first [table] header so api_key_env
+    # under [default_model] can never be picked up, whatever the line order is.
+    awk '
+        /^[[:space:]]*\[/ { exit }
+        /^[[:space:]]*api_key[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            gsub(/^["'"'"']|["'"'"'][[:space:]]*$/, "")
+            print; exit
+        }' "$OF_CONFIG"
+}
+
+if [ -n "$keysrc" ]; then
+    k=$(read_key)
+    if [ -n "${OPENFANG_API_KEY:-}" ]; then src='$OPENFANG_API_KEY'; else src="$OF_CONFIG (top-level api_key)"; fi
+    echo "source: $src"
+    echo "length: ${#k} chars (51 is correct on this box; 71 means api_key_env got concatenated)"
+    exit 0
+fi
+
+[ $# -ge 2 ] || { usage >&2; exit 64; }
+method=$1; path=$2; body=${3:-}
+case $path in /*) ;; *) echo "ofctl: PATH must start with / (got '$path')" >&2; exit 64 ;; esac
+
+tmpd=$(mktemp -d) || exit 2
+trap 'rm -rf "$tmpd"' EXIT INT TERM HUP
+
+curlrc=$tmpd/curlrc
+: > "$curlrc"; chmod 600 "$curlrc"
+if [ -z "$noauth" ]; then
+    key=$(read_key)
+    [ -n "$key" ] || { echo "ofctl: no api_key found in $OF_CONFIG" >&2; exit 2; }
+    printf 'header = "Authorization: Bearer %s"\n' "$key" >> "$curlrc"
+fi
+
+set -- --config "$curlrc" -sS -m "$timeout" -X "$method" -o "$tmpd/body" -w '%{http_code}'
+
+if [ -n "$body" ]; then
+    case $body in
+        @*) f=${body#@}; [ -r "$f" ] || { echo "ofctl: cannot read body file $f" >&2; exit 2; }; cp "$f" "$tmpd/req" ;;
+        -)  cat > "$tmpd/req" ;;
+        *)  printf '%s' "$body" > "$tmpd/req" ;;
+    esac
+    set -- "$@" -H 'Content-Type: application/json' --data-binary "@$tmpd/req"
+fi
+
+crc=0
+code=$(curl "$@" "$OF_URL$path") || crc=$?
+if [ "$crc" -ne 0 ]; then
+    case $crc in
+        28) echo "ofctl: timed out after ${timeout}s. Raise -t, or note that /api/logs/stream is an endless SSE stream and will always time out." >&2 ;;
+        *)  echo "ofctl: no response from $OF_URL (curl exit $crc - is openfang-openfang-1 up?)" >&2 ;;
+    esac
+    exit 2
+fi
+
+if [ -n "$status_only" ]; then
+    echo "$code"
+    case $code in 2*) exit 0 ;; *) exit 1 ;; esac
+fi
+
+if [ -n "$extract" ]; then
+    python3 - "$extract" "$tmpd/body" <<'PY' || { echo "ofctl: --extract failed; rerun without -x to see the raw body" >&2; exit 1; }
+import json, sys
+path, f = sys.argv[1], sys.argv[2]
+d = json.load(open(f))
+for part in path.split('.'):
+    d = d[int(part)] if isinstance(d, list) else d[part]
+print(d if isinstance(d, str) else json.dumps(d))
+PY
+elif [ -s "$tmpd/body" ]; then
+    if [ -n "$raw" ]; then
+        cat "$tmpd/body"
+    else
+        python3 -m json.tool < "$tmpd/body" 2>/dev/null || cat "$tmpd/body"
+    fi
+fi
+
+case $code in
+    2*) exit 0 ;;
+    *)
+        echo "ofctl: HTTP $code on $method $path" >&2
+        if [ ! -s "$tmpd/body" ] && [ "$code" = "400" ]; then
+            echo "ofctl: empty 400 body is the signature of a malformed Authorization header - run 'ofctl --show-key-source' (expect 51 chars)." >&2
+        fi
+        exit 1 ;;
+esac

@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""ofcron - manage OpenFang cron jobs, the only scheduler on this box that works.
+
+The three things this exists to stop:
+
+  * `agent_id` is parsed strictly as a UUID (kernel.rs:7406-7408), so a name
+    gives `Invalid agent ID: invalid character`. This resolves names for you.
+  * Enable *and* disable both go through `PUT .../enable` with an
+    {"enabled": bool} body. POST .../enable is 405, .../disable is 404, and the
+    `openfang cron enable|disable` CLI prints a checkmark while doing nothing.
+  * The create body is validated in ways that 400 with terse messages: the name
+    charset, exactly-5-field cron with no letters, timeout bounds. All of that
+    is checked here before anything is sent.
+
+It also refuses to put a credential in a delivery target. GET /api/cron/* is in
+the public allowlist and returns delivery_targets verbatim, so an auth_header
+there is a key published to everything that can reach the port.
+
+Stdlib only. Run on the host.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+HOME_HOST = os.environ.get(
+    "OPENFANG_HOME_HOST", "/var/lib/docker/volumes/openfang_openfang-data/_data"
+)
+BASE_URL = os.environ.get("OPENFANG_URL", "http://127.0.0.1:4200").rstrip("/")
+CONFIG = os.environ.get("OPENFANG_CONFIG", os.path.join(HOME_HOST, "config.toml"))
+
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9 _-]{1,128}$")
+CRON_FIELD_RE = re.compile(r"^[0-9*/,?-]+$")
+
+
+def die(msg, code=1):
+    sys.stdout.flush()
+    print(f"ofcron: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def api_key():
+    if os.environ.get("OPENFANG_API_KEY"):
+        return os.environ["OPENFANG_API_KEY"]
+    try:
+        with open(CONFIG) as fh:
+            for line in fh:
+                s = line.strip()
+                if s.startswith("["):
+                    break
+                m = re.match(r'api_key\s*=\s*["\'](.*?)["\']\s*$', s)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    die(f"no top-level api_key in {CONFIG} (set OPENFANG_API_KEY)", 2)
+
+
+def request(method, path, body=None, timeout=30):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE_URL + path, data=data, method=method)
+    if data:
+        req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", "Bearer " + api_key())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, raw.decode("utf-8", "replace")
+    except Exception as e:
+        die(f"no response from {BASE_URL}: {e}", 2)
+
+
+def resolve_agent(ref):
+    if UUID_RE.match(ref):
+        return ref
+    code, agents = request("GET", "/api/agents")
+    if code != 200 or not isinstance(agents, list):
+        die(f"cannot list agents to resolve {ref!r} (HTTP {code})")
+    hits = [a for a in agents if a.get("name") == ref]
+    if not hits:
+        names = ", ".join(sorted(a.get("name", "?") for a in agents))
+        die(f"no agent named {ref!r}. Known: {names}")
+    if len(hits) > 1:
+        die(f"{len(hits)} agents named {ref!r}; pass the uuid")
+    return hits[0]["id"]
+
+
+def job_id_from_create(resp):
+    """POST /api/cron/jobs answers {"result": "{\\"job_id\\":\\"...\\"}"} - the
+    payload is a JSON string containing JSON. Unwrap both layers."""
+    if isinstance(resp, dict):
+        if "job_id" in resp:
+            return resp["job_id"]
+        inner = resp.get("result")
+        if isinstance(inner, str):
+            try:
+                return json.loads(inner).get("job_id")
+            except Exception:
+                return None
+    return None
+
+
+# ------------------------------------------------------------------------ list
+
+def cmd_list(args):
+    code, data = request("GET", "/api/cron/jobs")
+    if code != 200:
+        die(f"HTTP {code}: {data}")
+    jobs = data.get("jobs", [])
+    if not jobs:
+        print("no cron jobs")
+        return 0
+    print(f"{'ID':38}{'NAME':26}{'ON':4}{'SCHEDULE':26}{'NEXT RUN':22}FAILS")
+    for m in jobs:
+        j = m.get("job", m)
+        s = j.get("schedule") or {}
+        if s.get("kind") == "cron":
+            sched = f"{s.get('expr')} {s.get('tz') or 'UTC'}"
+        elif s.get("kind") == "every":
+            sched = f"every {s.get('every_secs')}s"
+        else:
+            sched = f"at {s.get('at')}"
+        fails = m.get("consecutive_errors", j.get("consecutive_errors", 0))
+        print(
+            f"{j.get('id', '?'):38}{(j.get('name') or '')[:25]:26}"
+            f"{'y' if j.get('enabled') else 'n':4}{sched[:25]:26}"
+            f"{str(j.get('next_run') or '-')[:21]:22}{fails}"
+        )
+        risky = re.search(r"auth|bearer|token|secret|password|api[_-]?key",
+                          json.dumps(j.get("delivery_targets") or []), re.I)
+        if risky:
+            print("   ! this job's delivery_targets look like they hold a credential, and "
+                  "GET /api/cron/jobs needs no credential to read")
+    return 0
+
+
+def cmd_status(args):
+    code, data = request("GET", f"/api/cron/jobs/{args.id}/status")
+    if code != 200:
+        die(f"HTTP {code}: {data}")
+    print(json.dumps(data, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------- create
+
+def validate_cron(expr):
+    fields = expr.split()
+    if len(fields) != 5:
+        die(f"cron expression needs exactly 5 fields, got {len(fields)}: {expr!r}. "
+            "6-field (with seconds) is accepted by the scheduler but rejected by the "
+            "creation validator")
+    for i, f in enumerate(fields, 1):
+        if not CRON_FIELD_RE.match(f):
+            die(f"cron field {i} ({f!r}) has characters the validator rejects. Only "
+                "0-9 * / - , ? are allowed - no letters, so MON-FRI, @daily and @hourly "
+                "all fail. Write 1-5 for weekdays")
+
+
+def cmd_create(args):
+    if not NAME_RE.match(args.name):
+        die(f"name {args.name!r} is invalid: /api/cron/jobs accepts only letters, digits, "
+            "spaces, '-' and '_', max 128 chars, and does not sanitise for you")
+
+    picked = [x for x in (args.cron, args.every, args.at) if x]
+    if len(picked) != 1:
+        die("pick exactly one of --cron, --every, --at")
+    if args.cron:
+        validate_cron(args.cron)
+        schedule = {"kind": "cron", "expr": args.cron, "tz": args.tz}
+    elif args.every:
+        secs = int(args.every)
+        if not 60 <= secs <= 86400:
+            die(f"--every must be 60..86400 seconds, got {secs}")
+        schedule = {"kind": "every", "every_secs": secs}
+    else:
+        try:
+            when = dt.datetime.fromisoformat(args.at.replace("Z", "+00:00"))
+        except ValueError:
+            die(f"--at must be ISO-8601, e.g. 2026-09-01T09:00:00Z (got {args.at!r})")
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=dt.timezone.utc)
+        now = dt.datetime.now(dt.timezone.utc)
+        if not now < when < now + dt.timedelta(days=365):
+            die("--at must be in the future and no more than a year out")
+        schedule = {"kind": "at", "at": when.astimezone(dt.timezone.utc)
+                    .isoformat().replace("+00:00", "Z")}
+
+    if args.system_event:
+        action = {"kind": "system_event", "text": args.system_event}
+    else:
+        if not args.message:
+            die("give --message (an agent turn) or --system-event (no LLM call)")
+        t = int(args.timeout)
+        if not 10 <= t <= 600:
+            die(f"--timeout must be 10..600 seconds, got {t}. It is not optional in "
+                "practice: the 120 s default kills most real runs")
+        action = {"kind": "agent_turn", "message": args.message,
+                  "model_override": None, "timeout_secs": t}
+
+    targets = []
+    for path in args.file or []:
+        targets.append({"type": "local_file", "path": path, "append": True})
+    for url in args.webhook or []:
+        if not url.startswith(("http://", "https://")):
+            die(f"webhook url must start with http:// or https:// (got {url!r})")
+        if re.search(r"(token|key|secret|signature)=", url, re.I):
+            print("! that webhook URL carries what looks like a credential in its query "
+                  "string, and GET /api/cron/jobs publishes delivery_targets verbatim "
+                  "with no credential required", file=sys.stderr)
+        targets.append({"type": "webhook", "url": url})
+    for spec in args.channel or []:
+        if ":" not in spec:
+            die(f"--channel wants type:recipient (got {spec!r})")
+        ctype, recipient = spec.split(":", 1)
+        targets.append({"type": "channel", "channel_type": ctype, "recipient": recipient})
+
+    body = {
+        "agent_id": resolve_agent(args.agent),
+        "name": args.name,
+        "schedule": schedule,
+        "action": action,
+        # kind:none always counts as delivered. A `channel` delivery that fails
+        # is recorded as a *job* failure, and five in a row auto-disable the job.
+        "delivery": {"kind": "none"},
+        "delivery_targets": targets,
+        "one_shot": bool(args.one_shot),
+    }
+
+    print(json.dumps(body, indent=2))
+    if args.dry_run:
+        print("\n[dry-run] not sent")
+        return 0
+    code, resp = request("POST", "/api/cron/jobs", body)
+    if code not in (200, 201):
+        die(f"HTTP {code}: {resp}")
+    jid = job_id_from_create(resp)
+    print(f"\ncreated {jid}")
+    print(f"  ofcron status {jid}")
+    print(f"  ofcron run {jid}      # fires now, async, and does NOT skip the next scheduled fire")
+    return 0
+
+
+# ------------------------------------------------------------- enable / disable
+
+def set_enabled(jid, value):
+    # There is no /disable route. Both directions are PUT .../enable with a body.
+    code, resp = request("PUT", f"/api/cron/jobs/{jid}/enable", {"enabled": value})
+    if code != 200:
+        die(f"HTTP {code}: {resp}")
+    print(f"{jid} enabled={value}"
+          + ("  (this also zeroes consecutive_errors and recomputes next_run)" if value else ""))
+    return 0
+
+
+def cmd_enable(args):
+    return set_enabled(args.id, True)
+
+
+def cmd_disable(args):
+    return set_enabled(args.id, False)
+
+
+def cmd_run(args):
+    code, resp = request("POST", f"/api/cron/jobs/{args.id}/run")
+    if code != 200:
+        die(f"HTTP {code}: {resp} (400 means the job is disabled)")
+    print(json.dumps(resp, indent=2))
+    print(f"async - poll with: ofcron status {args.id}")
+    return 0
+
+
+def cmd_rm(args):
+    if not args.yes:
+        code, data = request("GET", f"/api/cron/jobs/{args.id}/status")
+        print(json.dumps(data, indent=2) if code == 200 else f"HTTP {code}: {data}")
+        print("\ndry run. Re-run with --yes to delete. Deletion is not recoverable "
+              "from the API; a backup of cron_jobs.json is (see ofbackup).")
+        return 0
+    code, resp = request("DELETE", f"/api/cron/jobs/{args.id}")
+    if code not in (200, 204):
+        die(f"HTTP {code}: {resp}")
+    print(f"deleted {args.id}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ofcron",
+        description="Manage OpenFang cron jobs (the only reliable scheduler in v0.6.9).",
+        epilog="Agent-level [schedule] periodic understands only 'every <N>s|m|h|d'; a real cron "
+               "expression there silently becomes 300 seconds. Use these jobs for wall-clock work.",
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("list", help="table of every job with next_run and failure count")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("status", help="full JobMeta for one job")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("create", help="create a job, validating everything the API will 400 on")
+    p.add_argument("--agent", required=True, help="agent uuid or name (names are resolved here)")
+    p.add_argument("--name", required=True, help="letters, digits, spaces, - and _ only")
+    p.add_argument("--cron", help='5 fields, digits and * / - , ? only: "0 3 * * 1-5"')
+    p.add_argument("--tz", help="IANA zone for --cron, e.g. Europe/Berlin. Default UTC")
+    p.add_argument("--every", type=int, help="interval in seconds, 60..86400")
+    p.add_argument("--at", help="one-shot ISO-8601 instant, future, within a year")
+    p.add_argument("--message", help="agent_turn prompt (<= 16384 chars)")
+    p.add_argument("--system-event", help="inject a system event instead - no LLM call")
+    p.add_argument("--timeout", type=int, default=600, help="agent_turn timeout, 10..600 (default 600)")
+    p.add_argument("--file", action="append", help="local_file delivery target, repeatable")
+    p.add_argument("--webhook", action="append", help="webhook delivery target, repeatable")
+    p.add_argument("--channel", action="append", metavar="TYPE:RECIPIENT",
+                   help="channel delivery target, repeatable")
+    p.add_argument("--one-shot", action="store_true", help="delete the job after it fires once")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_create)
+
+    p = sub.add_parser("enable", help="PUT .../enable {\"enabled\":true}")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_enable)
+
+    p = sub.add_parser("disable", help="same route, {\"enabled\":false} - there is no /disable")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_disable)
+
+    p = sub.add_parser("run", help="fire now (async; does not skip the next scheduled fire)")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("rm", help="delete a job (prints it first unless --yes)")
+    p.add_argument("id")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(fn=cmd_rm)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

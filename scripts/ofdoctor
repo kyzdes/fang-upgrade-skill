@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""ofdoctor - preflight for this box's OpenFang instance.
+
+The shipped `openfang doctor` is not a substitute. It checks 11 hardcoded
+provider env-var names, so on a box with a custom provider it ends with
+"No LLM provider API keys found!" while the instance is working perfectly -
+and it says nothing about the things that actually break here: a truncated
+api_key, an unregistered provider, a model that resolves to a fabricated
+price and context window, secrets served by unauthenticated endpoints, or a
+hand that exists on disk but was never loaded.
+
+Everything here is read-only: HTTP GETs plus `docker exec ... command -v`.
+Nothing is printed that would reveal a secret value.
+
+Stdlib only. Run on the host (the container has no curl).
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+HOME_HOST = os.environ.get(
+    "OPENFANG_HOME_HOST", "/var/lib/docker/volumes/openfang_openfang-data/_data"
+)
+BASE_URL = os.environ.get("OPENFANG_URL", "http://127.0.0.1:4200").rstrip("/")
+CONTAINER = os.environ.get("OPENFANG_CONTAINER", "openfang-openfang-1")
+
+# Public paths worth probing for secret leakage. /api/cron/* is the documented
+# offender: it returns delivery_targets verbatim, headers included.
+LEAK_PROBES = [
+    "/api/cron/jobs",
+    "/api/config",
+    "/api/agents",
+    "/api/hands",
+    "/api/sessions",
+    "/api/approvals",
+    "/api/health/detail",
+]
+
+# Binaries the references assume one way or the other. yt-dlp is the fragile
+# one: it only ever exists because of `pip3 install` into the writable layer,
+# which does not survive --force-recreate or a rebuild.
+CONTAINER_BINS_EXPECTED = ["python3", "node", "npm", "pip3", "tar"]
+CONTAINER_BINS_OPTIONAL = ["yt-dlp"]
+CONTAINER_BINS_ABSENT = ["curl", "git", "ffmpeg", "sqlite3", "jq"]
+
+RESULTS = []
+
+
+def record(status, title, detail="", fix=""):
+    RESULTS.append((status, title, detail, fix))
+
+
+def get(path, key=None, timeout=10):
+    """GET path. Returns (status_code, body_bytes). Never raises."""
+    req = urllib.request.Request(BASE_URL + path, method="GET")
+    if key:
+        req.add_header("Authorization", "Bearer " + key)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except Exception as e:  # connection refused, DNS, timeout
+        return 0, str(e).encode()
+
+
+def get_json(path, key=None, timeout=10):
+    code, body = get(path, key, timeout)
+    try:
+        return code, json.loads(body)
+    except Exception:
+        return code, None
+
+
+def read_top_level_api_key(path):
+    """The top-level api_key only: stop at the first [table].
+
+    A plain `grep '^api_key'` also matches api_key_env under [default_model];
+    cut then concatenates both into a 71-char string and every request fails
+    HTTP 400 with an empty body.
+    """
+    try:
+        with open(path, "r") as fh:
+            for line in fh:
+                s = line.strip()
+                if s.startswith("["):
+                    return None
+                m = re.match(r'api_key\s*=\s*["\'](.*?)["\']\s*$', s)
+                if m:
+                    return m.group(1)
+    except OSError:
+        return None
+    return None
+
+
+def naive_grep_key(path):
+    """What the broken `grep '^api_key' | cut -d'\"' -f2` would have produced."""
+    try:
+        out = []
+        with open(path) as fh:
+            for line in fh:
+                if line.startswith("api_key"):
+                    parts = line.split('"')
+                    if len(parts) > 1:
+                        out.append(parts[1])
+        # $(...) keeps the newline between the two matched lines - that is why the
+        # broken form is 71 chars here, not 70.
+        return "\n".join(out)
+    except OSError:
+        return ""
+
+
+def load_toml(path):
+    try:
+        import tomllib
+
+        with open(path, "rb") as fh:
+            return tomllib.load(fh)
+    except Exception:
+        return {}
+
+
+def read_env_file(path):
+    """name -> value from a KEY=VALUE file. Values are never printed."""
+    env = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return env
+
+
+def docker(*args, timeout=25):
+    try:
+        p = subprocess.run(
+            ["docker", *args], capture_output=True, text=True, timeout=timeout
+        )
+        return p.returncode, p.stdout + p.stderr
+    except Exception as e:
+        return 127, str(e)
+
+
+def find_secret(obj, needles, trail=""):
+    """Walk parsed JSON and return the path of the first value containing a secret."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            hit = find_secret(v, needles, f"{trail}.{k}" if trail else k)
+            if hit:
+                return hit
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            hit = find_secret(v, needles, f"{trail}[{i}]")
+            if hit:
+                return hit
+    elif isinstance(obj, str):
+        for name, val in needles:
+            if val and val in obj:
+                return f"{trail or '<root>'} contains {name}"
+    return None
+
+
+# --------------------------------------------------------------------------- checks
+
+
+def check_key(cfg_path):
+    key = read_top_level_api_key(cfg_path)
+    if not key:
+        record(
+            "FAIL",
+            "api_key extractable",
+            f"no top-level api_key in {cfg_path}",
+            "every authenticated route will 401/400 until this exists",
+        )
+        return None
+    record("OK", "api_key extractable", f"{len(key)} chars, top-level in {cfg_path}")
+
+    naive = naive_grep_key(cfg_path)
+    if naive != key:
+        record(
+            "NOTE",
+            "grep foot-gun still armed",
+            f"`grep '^api_key' | cut -d'\"' -f2` yields {len(naive)} chars, not {len(key)} "
+            "- it swallows api_key_env too, and the request fails HTTP 400 with an empty body",
+            "use scripts/ofctl, or `grep -m1 '^api_key = '` with the spaces",
+        )
+    return key
+
+
+def check_daemon(key):
+    code, body = get_json("/api/health")
+    if code != 200 or not body:
+        record("FAIL", "daemon reachable", f"GET {BASE_URL}/api/health -> {code}",
+               f"docker start {CONTAINER}")
+        return False
+    record("OK", "daemon reachable", f"{BASE_URL} v{body.get('version')}")
+
+    code, detail = get_json("/api/health/detail")
+    if code == 200 and detail:
+        up = int(detail.get("uptime_seconds", 0))
+        record(
+            "OK",
+            "daemon health detail",
+            f"agents={detail.get('agent_count')} db={detail.get('database')} "
+            f"panics={detail.get('panic_count')} restarts={detail.get('restart_count')} "
+            f"uptime={up // 3600}h{(up % 3600) // 60}m",
+        )
+        for w in detail.get("config_warnings") or []:
+            record("WARN", "config warning from daemon", str(w))
+    return True
+
+
+def check_auth(key):
+    authed, _ = get("/api/security", key)
+    anon, _ = get("/api/security")
+    if authed == 200 and anon == 401:
+        record("OK", "auth works and is enforced", "/api/security 200 with key, 401 without")
+    elif authed != 200:
+        record(
+            "FAIL",
+            "authenticated request rejected",
+            f"/api/security with key -> {authed}",
+            "an empty-bodied 400 means a malformed header: `ofctl --show-key-source` should say 51 chars",
+        )
+    elif anon == 200:
+        record(
+            "FAIL",
+            "auth not enforced",
+            "/api/security answered with no credential",
+            "api_key is empty or auth is disabled in config.toml",
+        )
+
+
+def check_provider_and_model(cfg, key):
+    dm = cfg.get("default_model") or {}
+    prov, model = dm.get("provider"), dm.get("model")
+    if not prov or not model:
+        record("WARN", "[default_model] incomplete", f"provider={prov!r} model={model!r}")
+        return
+
+    # #1195: strip_provider_prefix builds "{provider}/" at runtime and truncates any
+    # model id starting with it - silently, and the truncated id is persisted.
+    if model.startswith(prov + "/"):
+        record(
+            "FAIL",
+            "#1195 prefix collision",
+            f"model {model!r} starts with '{prov}/' - strip_provider_prefix "
+            "(agent_loop.rs:212-222) will truncate it and persist the truncation",
+            f"rename the provider to anything that is not a prefix of the model id",
+        )
+    else:
+        record("OK", "#1195 prefix collision", f"provider {prov!r} is not a prefix of {model!r}")
+
+    code, provs = get_json("/api/providers")
+    ids = [p.get("id") for p in (provs or {}).get("providers", [])] if code == 200 else []
+    if prov in ids:
+        record("OK", "provider registered", f"{prov} visible in /api/providers ({len(ids)} total)")
+    else:
+        record(
+            "WARN",
+            "provider not registered",
+            f"[default_model].provider = {prov!r} but it is absent from /api/providers "
+            f"({len(ids)} entries). Inference still works from base_url; the provider is "
+            "just invisible to /api/providers, the dashboard and any per-provider route",
+            f"ofctl PUT /api/providers/{prov}/url '{{\"base_url\":\"{dm.get('base_url', '<BASE_URL>')}\"}}' "
+            f"(or add a [provider_urls] entry to config.toml and restart)",
+        )
+
+    code, models = get_json("/api/models")
+    entries = (models or {}).get("models", []) if code == 200 else []
+    hit = next((m for m in entries if m.get("id") == model), None)
+    if not hit:
+        record(
+            "FAIL",
+            "model resolves",
+            f"{model!r} is not in /api/models ({len(entries)} entries)",
+            "register it: ofctl POST /api/models/custom '{...}'",
+        )
+        return
+    record(
+        "OK",
+        "model resolves",
+        f"{model} ctx={hit.get('context_window')} out={hit.get('max_output_tokens')} "
+        f"tools={hit.get('supports_tools')}",
+    )
+
+    custom_ids = set()
+    try:
+        with open(os.path.join(HOME_HOST, "custom_models.json")) as fh:
+            custom = json.load(fh)
+        custom_ids = {c.get("id") for c in custom}
+    except Exception:
+        custom = []
+    if model not in custom_ids:
+        record(
+            "WARN",
+            "model not in custom_models.json",
+            "an uncatalogued model is metered at a fabricated $1/$3 per-M "
+            "(metering.rs:203) and assumed to hold 200 000 tokens",
+            "POST /api/models/custom with the real context_window and pricing",
+        )
+    elif (hit.get("input_cost_per_m"), hit.get("output_cost_per_m")) == (0.0, 0.0):
+        record(
+            "NOTE",
+            "model priced at 0.0/0.0",
+            "deliberate here, but it means every cost report and budget check reads $0",
+        )
+
+    # Provider key: the daemon reads it from its own process env, seeded from secrets.env.
+    env_name = dm.get("api_key_env")
+    if env_name:
+        secrets = read_env_file(os.path.join(HOME_HOST, "secrets.env"))
+        if env_name in secrets and secrets[env_name]:
+            record("OK", "provider key present", f"{env_name} set in {HOME_HOST}/secrets.env")
+        else:
+            rc, out = docker("exec", CONTAINER, "sh", "-c", f'test -n "${env_name}"')
+            if rc == 0:
+                record("OK", "provider key present", f"{env_name} in the container env")
+            else:
+                record(
+                    "FAIL",
+                    "provider key missing",
+                    f"{env_name} is in neither {HOME_HOST}/secrets.env nor the container env",
+                    f"add {env_name}=... to secrets.env and docker restart {CONTAINER}",
+                )
+
+
+def check_leaks(key, cfg_path):
+    needles = [("the daemon api_key", key)] if key else []
+    for name, val in read_env_file(os.path.join(HOME_HOST, "secrets.env")).items():
+        if val and len(val) >= 12:
+            needles.append((name, val))
+    if not needles:
+        return
+    leaked = []
+    for path in LEAK_PROBES:
+        code, body = get(path)  # deliberately unauthenticated
+        if code != 200:
+            continue
+        text = body.decode("utf-8", "replace")
+        for nname, nval in needles:
+            if nval in text:
+                try:
+                    where = find_secret(json.loads(text), [(nname, nval)]) or "body"
+                except Exception:
+                    where = "body"
+                leaked.append(f"{path} -> {where}")
+    if leaked:
+        record(
+            "FAIL",
+            "secret served without a credential",
+            "; ".join(leaked)
+            + f". These paths answer anonymously on {BASE_URL} and on the Tailnet address",
+            "remove the secret from the object (never put a credential in a cron "
+            "delivery_target) and treat the value as compromised",
+        )
+    else:
+        record(
+            "OK",
+            "no secret on public endpoints",
+            f"{len(LEAK_PROBES)} unauthenticated paths scanned for the daemon key "
+            f"and {len(needles) - 1} provider secret(s)",
+        )
+
+
+def check_cron():
+    code, data = get_json("/api/cron/jobs")
+    if code != 200 or data is None:
+        record("WARN", "cron jobs unreadable", f"GET /api/cron/jobs -> {code}")
+        return
+    jobs = data.get("jobs", [])
+    if not jobs:
+        record("OK", "cron jobs", "none defined")
+        return
+    risky = re.compile(r"auth|bearer|token|secret|password|api[_-]?key", re.I)
+    for j in jobs:
+        jid, name = j.get("id", "?"), j.get("name", "?")
+        fails = j.get("consecutive_failures", 0) or 0
+        bits = [f"enabled={j.get('enabled')}", f"failures={fails}/5"]
+        record("OK", f"cron {name}", f"{jid} " + " ".join(bits))
+        if fails >= 3:
+            record(
+                "WARN",
+                f"cron {name} near auto-disable",
+                f"{fails} consecutive failures; 5 disables the job "
+                "(a failed channel delivery counts as a failure)",
+            )
+        blob = json.dumps(j.get("delivery_targets") or [])
+        if risky.search(blob):
+            record(
+                "FAIL",
+                f"cron {name} carries a credential-shaped field",
+                "delivery_targets are returned verbatim by the public GET /api/cron/jobs",
+                "move the secret out of the job; a host crontab entry can hold it instead",
+            )
+
+
+def check_hands():
+    code, data = get_json("/api/hands")
+    registry = {h.get("id") for h in (data or {}).get("hands", [])} if code == 200 else set()
+    hands_dir = os.path.join(HOME_HOST, "hands")
+    on_disk = set()
+    if os.path.isdir(hands_dir):
+        on_disk = {
+            d
+            for d in os.listdir(hands_dir)
+            if os.path.isfile(os.path.join(hands_dir, d, "HAND.toml"))
+        }
+    missing = on_disk - registry
+    if missing:
+        record(
+            "WARN",
+            "hand on disk but not loaded",
+            ", ".join(sorted(missing)) + " - the registry only reads hands/ at boot",
+            f"docker restart {CONTAINER}",
+        )
+    elif on_disk:
+        record("OK", "workspace hands loaded", ", ".join(sorted(on_disk)))
+
+    try:
+        with open(os.path.join(HOME_HOST, "hand_state.json")) as fh:
+            state = json.load(fh)
+    except Exception:
+        state = []
+    if state:
+        code, agents = get_json("/api/agents")
+        live = {a.get("id") for a in (agents or [])} if code == 200 else set()
+        for inst in state:
+            hid, aid = inst.get("hand_id"), inst.get("agent_id")
+            if aid in live:
+                record("OK", f"hand instance {hid}", f"agent {aid} running")
+            else:
+                record(
+                    "WARN",
+                    f"hand instance {hid} orphaned",
+                    f"hand_state.json points at agent {aid}, which is not in /api/agents",
+                )
+
+
+def check_container():
+    rc, _ = docker("inspect", "-f", "{{.State.Running}}", CONTAINER)
+    if rc != 0:
+        record("WARN", "container probe skipped", f"{CONTAINER} not inspectable from here")
+        return
+    wanted = CONTAINER_BINS_EXPECTED + CONTAINER_BINS_OPTIONAL + CONTAINER_BINS_ABSENT
+    script = "; ".join(f'command -v {b} >/dev/null && echo "{b}"' for b in wanted)
+    rc, out = docker("exec", CONTAINER, "sh", "-c", script)
+    present = set(out.split())
+    gone = [b for b in CONTAINER_BINS_EXPECTED if b not in present]
+    if gone:
+        record("FAIL", "container missing a base binary", ", ".join(gone))
+    else:
+        record("OK", "container base binaries", " ".join(CONTAINER_BINS_EXPECTED))
+    for b in CONTAINER_BINS_OPTIONAL:
+        if b in present:
+            record("OK", f"container {b}", "present - lives in the writable layer, so it "
+                                           "survives docker restart but not --force-recreate or a rebuild")
+        else:
+            record(
+                "NOTE",
+                f"container {b} absent",
+                "install it if a pipeline needs it",
+                f"docker exec {CONTAINER} pip3 install --break-system-packages {b}",
+            )
+    surprises = [b for b in CONTAINER_BINS_ABSENT if b in present]
+    if surprises:
+        record("NOTE", "container gained a binary the docs call absent", ", ".join(surprises))
+
+
+def check_storage():
+    dbdir = os.path.join(HOME_HOST, "data")
+    db = os.path.join(dbdir, "openfang.db")
+    if not os.path.exists(db):
+        record("FAIL", "database present", f"{db} missing")
+        return
+    wal = db + "-wal"
+    wal_mb = os.path.getsize(wal) / 1e6 if os.path.exists(wal) else 0
+    record(
+        "OK",
+        "database present",
+        f"{os.path.getsize(db) / 1e6:.1f} MB + {wal_mb:.1f} MB WAL. "
+        "WAL mode means `cp` of a live DB can tear - snapshot with scripts/ofbackup",
+    )
+    for name in ("config.toml", "secrets.env"):
+        p = os.path.join(HOME_HOST, name)
+        if os.path.exists(p):
+            mode = oct(os.stat(p).st_mode & 0o777)[2:]
+            if mode != "600":
+                record("WARN", f"{name} mode {mode}", "should be 600", f"chmod 600 {p}")
+
+    try:
+        with open(os.path.join(HOME_HOST, "daemon.json")) as fh:
+            listen = json.load(fh).get("listen_addr", "")
+    except Exception:
+        listen = ""
+    if listen.startswith("0.0.0.0"):
+        record(
+            "NOTE",
+            "daemon listens on all interfaces",
+            f"listen_addr={listen}; 41 path patterns need no credential, so everything "
+            "reachable on the Tailnet can read /api/agents, /api/config, /api/cron/*",
+        )
+
+
+def check_openfang_doctor():
+    rc, out = docker("exec", CONTAINER, "openfang", "doctor", timeout=60)
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    if "No LLM provider API keys found" in clean:
+        record(
+            "NOTE",
+            "`openfang doctor` false alarm",
+            "it printed '✘ No LLM provider API keys found!'. It only looks for 11 hardcoded "
+            "env-var names (GROQ_API_KEY, OPENAI_API_KEY, ...) and cannot see a custom "
+            "provider's key. Ignore that line; trust the provider check above",
+        )
+    bad = [l.strip() for l in clean.splitlines() if l.strip().startswith("✘")]
+    # "Some checks failed." is only the roll-up of the line above; drop both.
+    noise = ("No LLM provider API keys", "Some checks failed")
+    other = [l for l in bad if not any(n in l for n in noise)]
+    if other:
+        record("WARN", "`openfang doctor` failures worth reading", " | ".join(other))
+    else:
+        record("OK", "`openfang doctor` cross-check", "no failures beyond the known false alarm")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ofdoctor",
+        description="Read-only preflight for this box's OpenFang instance.",
+        epilog="Exit 0 when nothing FAILed, 1 otherwise (--strict also fails on WARN).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--full", action="store_true",
+                    help="also run the in-container `openfang doctor` and translate its output")
+    ap.add_argument("--strict", action="store_true", help="exit non-zero on WARN as well as FAIL")
+    ap.add_argument("--quiet", action="store_true", help="print only NOTE/WARN/FAIL lines")
+    args = ap.parse_args()
+
+    cfg_path = os.environ.get("OPENFANG_CONFIG", os.path.join(HOME_HOST, "config.toml"))
+    cfg = load_toml(cfg_path)
+
+    key = check_key(cfg_path)
+    if check_daemon(key):
+        check_auth(key)
+        check_provider_and_model(cfg, key)
+        check_leaks(key, cfg_path)
+        check_cron()
+        check_hands()
+    check_container()
+    check_storage()
+    if args.full:
+        check_openfang_doctor()
+
+    colw = max(len(t) for _, t, _, _ in RESULTS) + 2
+    counts = {}
+    for status, title, detail, fix in RESULTS:
+        counts[status] = counts.get(status, 0) + 1
+        if args.quiet and status == "OK":
+            continue
+        print(f"[{status:4}] {title.ljust(colw)}{detail}")
+        if fix:
+            print(f"{'':7}{'':{colw}}-> {fix}")
+    print(
+        "\n"
+        + "  ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        + f"   ({BASE_URL}, {HOME_HOST})"
+    )
+
+    if counts.get("FAIL"):
+        return 1
+    if args.strict and counts.get("WARN"):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
