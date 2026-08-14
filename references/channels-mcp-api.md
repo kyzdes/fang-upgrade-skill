@@ -172,7 +172,17 @@ match_rule = { channel = "discord", channel_id = "1234567890" }
 Three distinct credential leaks existed on this instance under stock v0.6.9 and are fixed on
 `ours`. If this instance ever ran the stock build before these commits landed, treat every
 credential below as burned and rotate it — the fix stops future leaks, it does nothing about a
-token that already went out in a log line or a session file.
+token that already went out in a log line or a session file. `ofdoctor` does not scan session
+files for this, so do it by hand — look for a bot token pattern (`bot[0-9]+:`) or `access_token=`/
+`?token=` query fragments inside stored sessions and logs:
+
+```bash
+grep -rlE 'bot[0-9]+:[A-Za-z0-9_-]{30,}' "$D"/sessions/ "$D"/logs/ 2>/dev/null
+grep -rlE '(access_token|token)=' "$D"/sessions/ "$D"/logs/ 2>/dev/null
+```
+
+Any hit is a live secret sitting in a persisted session or log, independent of whether the fix is
+deployed now — a match means rotate, a clean scan is not proof nothing leaked before rotation.
 
 1. **Telegram bot token in the LLM-visible prompt and in the session history on disk.**
    `telegram_get_file_url()` (`crates/openfang-channels/src/telegram.rs:904-923`) builds a
@@ -539,7 +549,7 @@ routes.
 
 | Group | Representative paths | Auth |
 |---|---|---|
-| Agents | `/api/agents`, `/api/agents/{id}/{message,session,mode,tools,skills,mcp_servers,clone,upload,ws,...}` | GET `/api/agents` public; everything else (including all mutating verbs) auth required |
+| Agents | `/api/agents`, `/api/agents/{id}/{message,session,mode,tools,skills,mcp_servers,clone,upload,ws,update,...}` | GET `/api/agents` public; everything else (including all mutating verbs) auth required. `PUT /api/agents/{id}/update` is auth-gated like the rest of the group but on this fork returns **501** and changes nothing — it does not silently no-op like stock's 200; see `SKILL.md` §"Point-editing an agent vs. `PUT /api/agents/{id}/update`" for the 8 routes that actually mutate a manifest field |
 | Channels | `/api/channels`, `/api/channels/{name}/configure`, `/api/channels/whatsapp/qr/*` | GET list public; configure/test/reload/QR all require auth |
 | Skills / Hands / ClawHub | `/api/skills*`, `/api/hands*`, `/api/clawhub/*` | GET listing endpoints mostly public (except `.../config` variants which are also GET-public); install/uninstall/activate require auth |
 | Workflows / Triggers / Cron | `/api/workflows*`, `/api/triggers*`, `/api/cron/jobs*`, `/api/schedules*` | GET `/api/workflows` and GET `/api/cron/*` public; create/update/delete/run require auth; `/api/triggers` and `/api/schedules` are **not** in the public list at all (even GET requires auth) |

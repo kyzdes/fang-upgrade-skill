@@ -77,7 +77,10 @@ https://www.youtube.com/feeds/videos.xml?channel_id=UC...
 - Events with no `segs` are positioning records — skip them.
 - The file is enormous relative to its text: a 3h46m video is 4.3 MB of json3
   that flattens to 222 KB of prose. **Never read the json3 with `file_read`** —
-  `file_read` has no size limit and returns the whole file.
+  a bare call (no `offset`/`limit`) still `read_to_string`s and returns the whole file with no
+  truncation; passing `offset`/`limit` avoids returning it all at once, but you'd have to know
+  where to cut a json3 blob to get valid JSON back, which isn't worth it here. Flatten it with
+  a script instead.
 
 ## Size budget
 

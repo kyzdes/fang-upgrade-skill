@@ -1,7 +1,9 @@
 # OpenFang — Known Issues & Project Status (GitHub-mined, as of 2026-08-09)
 
 Scope: `RightNow-AI/openfang`, evaluated against the **exact code we run**: tag `v0.6.9`, commit
-`acf2587e`, checked out at `/opt/openfang`, live in container `openfang-openfang-1` (`openfang 0.6.9`).
+`acf2587e` — mirrored on this repo's `main` branch, live in container `openfang-openfang-1`
+(`openfang 0.6.9`) until 2026-08-09. **Not** `/opt/openfang`: that path runs our fork (`ours`) now,
+not a bare `acf2587e` checkout — see below.
 
 Every claim below is either (a) a direct quote of an issue/PR, or (b) verified by reading v0.6.9
 source at the cited `file:line`. Where the issue text and the v0.6.9 code **disagree**, the code wins
@@ -20,7 +22,8 @@ tracker). So every row here is still an accurate description of a gap you'd hit 
 `routes.rs`, or `kernel.rs` — those four files carry the fork's edits, so their line numbers below
 have been re-verified against `/root/src/openfang` on `ours` (not the untouched `acf2587e` tree)
 and updated where the fork's insertions shifted them. Citations into any other file are unchanged
-from the original `acf2587e` research and still point at the bare-tag checkout at `/opt/openfang`.
+from the original `acf2587e` research; check them against this repo's `main` branch (the `acf2587e`
+mirror), not against `/opt/openfang` — that path runs `ours` now, not a bare-tag checkout.
 
 Reproduce the raw data with:
 
