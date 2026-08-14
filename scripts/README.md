@@ -1,17 +1,24 @@
 # Bundled scripts
 
-Five host-side tools plus one that runs inside the container. Everything is POSIX
-`sh` or python3 stdlib, so they have no dependency beyond what is already on the
-host, and nothing to install in the container (which has no `curl`).
-Each takes `--help`.
+Eight scripts: `ofctl`, `ofdoctor`, `ofhand`, `ofcron`, `ofbackup` run on the host and
+talk to the running daemon; `ytwatch.py` and `rtwatch.py` run *inside* the container as
+flat-argv helpers (`shell_exec` rejects pipes/redirection, so intake logic has to live in
+a script file, not a prompt); `ofcheck-rs` runs on the host but talks to neither — it
+drives a throwaway `rust:1-slim-bookworm` container to `cargo check` a worktree, so
+patches can be checked without installing Rust on the host. Everything is POSIX `sh` or
+python3 stdlib, so they have no dependency beyond what is already on the host, and
+nothing to install in the container (which has no `curl`). Each of the five API tools and
+`ofcheck-rs` takes `--help`.
 
 Put them on `$PATH` once per session, or call them by absolute path:
 
-    export PATH="$HOME/.claude/skills/openfang/scripts:$PATH"
+    export PATH="$HOME/.claude/skills/fang-upgrade/scripts:$PATH"
 
-All of them honour `OPENFANG_URL`, `OPENFANG_HOME_HOST`, `OPENFANG_CONTAINER`
-and `OPENFANG_API_KEY`, so they can be pointed at a second instance or at a
-scratch directory for a dry run.
+`ofctl`, `ofdoctor`, `ofhand`, `ofcron` and `ofbackup` honour `OPENFANG_URL`,
+`OPENFANG_HOME_HOST`, `OPENFANG_CONTAINER` and `OPENFANG_API_KEY`, so they can be pointed
+at a second instance or at a scratch directory for a dry run. `ofcheck-rs` is unrelated to
+the OpenFang API and ignores all four — it only takes a worktree path and optional crate
+names.
 
 ## `ofctl` — authenticated API calls
 
@@ -50,8 +57,8 @@ loaded, missing container binaries, file modes, WAL size. Exit 1 on any FAIL.
 ## `ofhand` — the hand lifecycle that survives a restart
 
     ofhand list
-    ofhand lint    /root/.claude/skills/openfang/assets/youtube-insights-hand
-    ofhand install /root/.claude/skills/openfang/assets/youtube-insights-hand
+    ofhand lint    /root/.claude/skills/fang-upgrade/assets/youtube-insights-hand
+    ofhand install /root/.claude/skills/fang-upgrade/assets/youtube-insights-hand
     ofhand activate youtube-insights videos_per_run=3
     ofhand set youtube-insights videos_per_run=1        # edits hand_state.json + restart
 
@@ -107,6 +114,31 @@ daemon.json hands/ workspaces/` and writes a MANIFEST with `integrity_check`,
 which is the classic way to replay a half-written transaction over a good
 backup. Triggers and workflow runs never persisted and do not come back.
 
+## `ofcheck-rs` — `cargo check` a worktree without installing Rust on the host
+
+    ofcheck-rs /root/src/openfang-worktrees/patch-123
+    ofcheck-rs /root/src/openfang-worktrees/patch-123 openfang-kernel openfang-api
+
+Runs `cargo check` for a fork worktree inside a throwaway `rust:1-slim-bookworm`
+container, so a review pass never needs a Rust toolchain on the host. Every worktree
+gets its **own** Docker volume as `CARGO_TARGET_DIR` (named `fang-target-<slug>` from the
+worktree's basename) instead of one shared target dir — an earlier version shared one
+volume across worktrees, and cargo's fingerprinting keys on mtime as well as path, so a
+check of a freshly patched tree could silently reuse a stale artifact built from a
+*different* copy at the same in-container path (`/build`) and report someone else's
+result. That failure mode looks exactly like a bad patch, not a broken tool, which is why
+the isolation is not optional. Cost: the first check of a new worktree is a cold build
+(~4.5 min); later checks are incremental. The package registry itself stays a single
+shared volume (`fang-cargo-registry`) since it's read-only from cargo's perspective and
+protected by its own file lock.
+
+That per-worktree target directory is 5-12 GB, and nine worktrees on a 77 GB disk have
+filled it before — `cargo` then dies mid-`clippy` with "No space left on device", which
+again looks like a patch defect. `ofcheck-rs` refuses to start with **less than 12 GB**
+free on `/` (exit 3, with a hint to `docker volume rm fang-target-<slug>` for merged
+patches) and prints a warning under 25 GB. There is no automatic cleanup — delete the
+volumes for merged/abandoned worktrees by hand.
+
 ## `ytwatch.py` — YouTube intake, runs *inside* the container
 
 Lists a channel's newest videos, fetches auto-captions **without downloading
@@ -115,7 +147,7 @@ file because `shell_exec` rejects pipes and redirection — it takes flat argv
 only.
 
     docker exec openfang-openfang-1 mkdir -p /data/workspaces/<agent>/bin
-    docker cp /root/.claude/skills/openfang/scripts/ytwatch.py \
+    docker cp /root/.claude/skills/fang-upgrade/scripts/ytwatch.py \
         openfang-openfang-1:/data/workspaces/<agent>/bin/ytwatch.py
     docker exec openfang-openfang-1 pip3 install --break-system-packages yt-dlp
 
@@ -124,3 +156,13 @@ parent is missing fails with `Could not find the file /…/bin in container`. Th
 source path is absolute because the skill is rarely loaded from its own directory.
 
 Full build guide, tested output and token budget: `references/youtube-pipeline.md`.
+
+## `rtwatch.py` — RuTube intake, runs *inside* the container
+
+Same shape as `ytwatch.py` (flat argv, one JSON object per invocation, `seen.json` state
+file), for RuTube instead of YouTube. Not a drop-in reuse: RuTube has no channel RSS feed,
+so listing goes through `yt-dlp --flat-playlist --dump-json` instead of an Atom fetch;
+subtitles are `srt`, not `json3`, and live under `subtitles` rather than
+`automatic_captions`, so fetching needs `--write-subs`, not `--write-auto-subs`; and video
+ids are 32-char hex instead of YouTube's 11-char base64 form. Install the same way as
+`ytwatch.py` — `mkdir -p` the workspace `bin/` first, then `docker cp`.

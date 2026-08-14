@@ -259,7 +259,7 @@ agent runs fine. The catalog is *advisory*. It is consulted only for:
 | Use | Code | Behaviour when the model is absent |
 |---|---|---|
 | Canonicalisation on agent register | `kernel.rs:1665-1676` | skipped entirely |
-| Pricing | `metering.rs:203` | falls back to **$1.00 / $3.00 per M** |
+| Pricing | `crates/openfang-kernel/src/metering.rs:289` | falls back to **$1.00 / $3.00 per M** |
 | Context window | `kernel.rs:2925-2929` | `None` → `DEFAULT_CONTEXT_WINDOW = 200_000` (`agent_loop.rs:225,502`) |
 | `available` flag in `/api/models` | `model_catalog.rs:293` | model simply isn't listed |
 | Router validation | `routing.rs:136` | emits a warning string only |
@@ -497,7 +497,7 @@ Two equivalent routes; both end at `add_custom_model()` (`model_catalog.rs:443`)
 `tier = Custom`.
 
 **File:** `$OPENFANG_HOME/custom_models.json` (here `/data/custom_models.json`), loaded at boot
-(`kernel.rs:838-840`). There is **no `config.toml` section for custom models** — grep confirms none.
+(`kernel.rs:870`). There is **no `config.toml` section for custom models** — grep confirms none.
 
 ```json
 [
@@ -544,7 +544,24 @@ Field defaults in `routes.rs:6561-6624` when omitted: `provider` → **`"openrou
 
 Duplicate `(id, provider)` case-insensitively → `409 Conflict` (`model_catalog.rs:446-452`).
 `remove_custom_model` only deletes `Custom`-tier entries, so builtins are safe
-(`model_catalog.rs:473`).
+(`model_catalog.rs:473`, `crates/openfang-runtime/src/model_catalog.rs`).
+
+**`remove_custom_model` recomputes `model_count` — fixed this fork (FANG-61).** Removing a custom
+model used to leave the owning provider's `ProviderInfo.model_count` (as returned by
+`GET /api/providers`) one too high until the daemon restarted, because only `add_custom_model`
+recomputed the count (`model_catalog.rs:458-465`) and `remove_custom_model` just retained/filtered
+`self.models` with no matching update. Now `remove_custom_model` collects the `provider`(s) that
+actually lost a model *before* retaining, then recomputes `model_count` for each affected provider
+by recounting `self.models` after the retain, mirroring `add_custom_model`'s own logic
+(`model_catalog.rs:476-494`). The pre-fix bug was a live-daemon-only staleness window, not
+permanent corruption: `ModelCatalog::new()` sets every provider's `model_count` from the builtin
+models alone at boot (`model_catalog.rs:41-43`, runs *before* any custom model is loaded), and the
+subsequent `load_custom_models()` call (`kernel.rs:870`) then re-adds each surviving entry from
+`custom_models.json` one at a time through `add_custom_model()` — which recomputes correctly on
+every call. A model deleted via the API is no longer in that file, so it simply isn't re-added, and
+the count comes out right on the next restart even without the fix. The fix only matters for a
+long-running daemon reading its own `/api/providers` between a `DELETE
+/api/models/custom/{*id}` call and its next restart.
 
 **This is the supported fix for cost tracking on a custom provider** — see [§9](#9-cost-tracking).
 
@@ -748,28 +765,168 @@ Triggered **only** when the primary returns `LlmErrorCategory::ModelNotFound`
 `strip_provider_prefix`. Per-agent fallback model ids are passed through verbatim, so you must write
 the exact upstream id. The global chain strips; the per-agent chain does not.
 
+### 8.3 Fallback `base_url` resolution — fixed this fork (FANG-61)
+
+**On stock OpenFang** (and in any deployment still running it — the symptom below is for that
+case): a per-agent `[[fallback_models]]` entry with no explicit `base_url` inherited
+`[default_model].base_url` unconditionally. If the fallback's provider differed from the default
+provider, this posted the *fallback's* API key to the *default's* host — observed as an HTTP 500
+wrapping the other provider's 401 body (e.g. a `y7router` key sent to `api.hyperfusion.io`). It
+looked intermittent because it only bit when the fallback provider actually differed from the
+default one, and `[provider_urls]` was checked, but third — behind `dm.base_url` — so it was only
+ever reached when `[default_model]` had *no* `base_url` set at all. The workaround on stock is to
+always set an explicit `base_url` on every `[[fallback_models]]` entry whose provider differs from
+`[default_model].provider`.
+
+**In this fork, no workaround is needed** — the resolution order was inverted to match how the
+*primary* model already worked (`resolve_driver`'s own comment: "Don't inherit default provider's
+base_url when switching providers") and how the global `[[fallback_providers]]` chain already
+worked (`kernel.rs:768-771`, unchanged by this fix — it always went straight from `fb.base_url` to
+`config.provider_urls.get(&fb.provider)`, no `dm.base_url` step, so it was never affected). Only the
+per-agent `[[fallback_models]]` path was wrong, and only it needed fixing:
+
+```rust
+fn effective_fallback_base_url(
+    fb_base_url: Option<&str>,
+    fb_provider: &str,
+    default_provider: &str,
+    default_base_url: Option<&str>,
+    lookup_provider_url: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let inherited = if fb_provider == default_provider { default_base_url } else { None };
+    fb_base_url.or(inherited).map(str::to_string).or_else(|| lookup_provider_url(fb_provider))
+}
+```
+(`kernel.rs:6930-6946`). The default's `base_url` is now inherited **only when the fallback's
+provider is the same as the default's** — otherwise the fallback's own explicit `base_url`, then
+`lookup_provider_url(fb_provider)` (`kernel.rs:5668-5682`: checks boot-time `config.provider_urls`
+first, the runtime model catalog second) resolves it. This is applied in two places that both need
+to agree, and did not before:
+
+1. `resolve_driver`'s own `ModelNotFound` fallback-driver construction (the `fb_config` at
+   `kernel.rs:5883`, now calling `effective_fallback_base_url(...)` instead of the old
+   `.or_else(|| dm.base_url.clone())` chain).
+2. `apply_fallback_base_urls(manifest)` (`kernel.rs:5692-5708`) — bakes the resolved `base_url`
+   into a **copy** of the manifest before it reaches `agent_loop`, because `agent_loop`'s own
+   `ModelNotFound` retry loop builds drivers straight from `manifest.fallback_models` and has no
+   visibility into `[provider_urls]` at all; before this existed such a fallback was dropped with
+   "has API key but no base_url configured" even when `[provider_urls]` had the answer. Called at
+   both agent-message dispatch sites (`kernel.rs:2161`, `kernel.rs:2728`), immediately after
+   cloning `entry.manifest`.
+
+Net effect for an operator: writing `[[fallback_models]]` for a provider that already has an entry
+in `[provider_urls]` — including one added only via `PUT /api/providers/{name}/url` at runtime, not
+just `config.toml` — no longer requires also copying that URL into the fallback block by hand. It is
+still good practice to set it explicitly when you want the fallback pinned to a specific host
+regardless of what `[provider_urls]` says later, since an explicit `fb.base_url` always wins.
+
 ---
 
 ## 9. Cost tracking
 
 ### 9.1 What actually runs
 
-The live path is `MeteringEngine::estimate_cost_with_catalog()` (`metering.rs:197`), called from
-`kernel.rs:2423`, `kernel.rs:2999`, `kernel.rs:3534`:
+`metering.rs` lives at `crates/openfang-kernel/src/metering.rs` — on this fork and on stock
+alike. The fork modified it (FANG-60 gave `MeteringEngine` its own `LlmCounters` state for the
+Prometheus `openfang_llm_*` series, §9.4) but did not move it: `git diff --name-status main...ours`
+reports `M`, not `R`. Line numbers below shifted with that change; the path did not.
+
+The live path is `MeteringEngine::estimate_cost_with_catalog()`
+(`crates/openfang-kernel/src/metering.rs:283`):
 
 ```rust
 let (input_per_m, output_per_m) = catalog.pricing(model).unwrap_or((1.0, 3.0));
 cost = input_tokens/1e6 * input_per_m + output_tokens/1e6 * output_per_m;
 ```
 
+**Call sites changed with FANG-60 (§9.1b): the accounting path now runs once per LLM call, not once
+per turn.** Current call sites: `kernel.rs:3088` (inside `record_turn_usage`, one call per entry of
+`result.calls` — this is the accounting path) and `ws.rs:968` (streaming path, mirrors `kernel.rs:3088`
+for the WS turn). A third call site, `kernel.rs:3602` (`session_usage_cost`), is unrelated to
+per-call accounting — it estimates a *live* session's running cost from a rough
+1-token-≈-4-characters count over `session.messages`, not from `usage_events`, and was not touched
+by FANG-60.
+
 `catalog.pricing()` (`model_catalog.rs:307`) is just `find_model(...)` → `(input_cost_per_m,
 output_cost_per_m)`.
 
-**The big "Cost Rates" pattern table in `docs/providers.md:773-805` is dead code.** It lives in
-`estimate_cost_rates()` (`metering.rs:236`), which is called only by
-`MeteringEngine::estimate_cost()` (`metering.rs:184`) — and `estimate_cost` has **zero non-test
-callers** in the entire workspace. No `*haiku*`/`*sonnet*`/`*llama*` heuristic ever runs in
-production. Unknown model ⇒ flat **$1.00 in / $3.00 out per million**, full stop.
+**The big "Cost Rates" pattern table in `docs/providers.md:773-805` is dead code, unchanged by this
+fork.** It lives in `estimate_cost_rates()` (`crates/openfang-kernel/src/metering.rs:322`), which is
+called only by `MeteringEngine::estimate_cost()` (`crates/openfang-kernel/src/metering.rs:270`) —
+and `estimate_cost` (the non-catalog one) still has **zero non-test callers** in the entire
+workspace, verified against the current tree same as against v0.6.9. No
+`*haiku*`/`*sonnet*`/`*llama*` heuristic ever runs in production. Unknown model ⇒ flat **$1.00 in /
+$3.00 out per million**, full stop.
+
+### 9.1b Per-call accounting, not per-turn (FANG-60)
+
+**Before this fork:** one `UsageRecord` was written per agent turn, priced against the single model
+the manifest said the agent used. A turn where the primary model failed mid-turn and a fallback
+served the rest booked the *whole turn's* tokens to whichever model happened to be named on the
+manifest — the two models' token counts were physically unrecoverable from one row.
+
+**Now:** the unit of accounting is one LLM call. `openfang-types/src/usage.rs` defines `LlmCall` —
+`n` (0-based call index = agent-loop iteration), `provider`, `model` (the model that **served** the
+call), `requested` (`Some` only on substitution — who was asked for), `reason` (why the requested
+model didn't serve it), `input_tokens`, `output_tokens`, `tool_calls`, `cost_usd`. The agent loop
+appends one `LlmCall` per LLM round-trip to `AgentLoopResult.calls`; `OpenFangKernel::record_turn_usage`
+(`kernel.rs:3058-3098`) then, after the turn finishes:
+
+1. Generates one `turn_id` (UUID) shared by every call of this turn.
+2. Prices each call individually via `estimate_cost_with_catalog(&call.model, ...)` — the model
+   that **served**, not the one configured — so a turn that fell back mid-way prices each half at
+   that half's own rate.
+3. Writes one `UsageRecord` (`openfang-memory/src/usage.rs`) per call via
+   `MeteringEngine::record_call` → `UsageStore::record`, populating all twelve `usage_events`
+   columns as they stand post-v9 (`id, agent_id, timestamp, model, input_tokens, output_tokens,
+   cost_usd, tool_calls, provider, turn_id, call_index, requested_model`) for every row this build
+   writes — only pre-v9 legacy rows carry `NULL` in the four new columns (see the schema section in
+   `architecture.md`).
+4. Sums `call.cost_usd` across the turn for the scalar `cost_usd` the API surfaces still expose.
+
+A safety net (`kernel.rs:3066-3079`) synthesizes a single whole-turn `LlmCall` if `result.calls` is
+ever empty — the comment calls this "unreachable today" since every agent-loop return path already
+populates it, kept only so tokens can't silently vanish if that ever stops being true.
+
+**What `/message`, SSE, WS and `/v1/chat/completions` disclose.** All four read the same
+`Vec<LlmCall>`, so they cannot contradict each other about *what happened* — but they do not
+share a shape. Read the per-surface table further down before writing a client: an agent that
+subscribes to SSE waiting for a `fallback` key will wait forever.
+
+- `model_used` / `provider_used` — the provider and model that served the turn's **last** call
+  (`last_served()`, `openfang-types/src/usage.rs`).
+- `fallback` — `Option<FallbackSummary>`, present only when some call in the turn was substituted.
+  **Six fields**, not four — `used` (always `true` when present), `calls` (how many calls of the
+  turn a substitute served), `of` (total calls in the turn), `requested` (what the *first*
+  substituted call asked for), `served_by` (de-duplicated list of models that actually served a
+  substituted call, in order), `reason` (why the requested model's first substituted attempt
+  failed). `fallback_summary()` derives this from `&[LlmCall]` on every read — it is never stored,
+  which is why "fell back from X to X" cannot be expressed (`requested` and `served_by` are read
+  from *different fields of the same row*).
+- `calls` — the full `Vec<LlmCall>`, one entry per call, in order.
+
+**Where each surface puts it — the shapes differ, and this is the part that bites:**
+
+| Surface | Shape |
+|---|---|
+| `POST /api/agents/{id}/message` | the four fields at the top level of `MessageResponse` (`openfang-api/src/types.rs:59-78`; assembled at `routes.rs:425-429`) |
+| SSE `/message/stream` | **no** `model_used` / `fallback` / `calls` anywhere. Instead one `event: call` per LLM call (`routes.rs:1646-1665`): `{n, provider, model, requested, reason, usage:{input_tokens, output_tokens}}` — no `cost_usd`, no turn-level summary. The `done` event keeps its pre-fork shape on purpose, so clients that only parse `done` are untouched |
+| WS `/api/agents/{id}/ws` | the `response` message carries `calls[]`, `fallback`, `model_used`, `iterations`, `cost_usd` (`ws.rs:981-997`) |
+| `POST /v1/chat/completions` | nested under a vendor key: `obj.insert("openfang", {model_used, provider_used, fallback, calls})` (`openai_compat.rs:365-373`). Read `resp["openfang"]["model_used"]` — `resp["model_used"]` is `null`. The streaming variant carries none of it (`openai_compat.rs:529`, `_ => continue`) |
+
+To reconstruct the turn from SSE, accumulate the `call` events yourself; there is no summary
+object on that surface.
+
+**`/api/usage/by-model` (`routes.rs:5755-5757` → `UsageStore::query_by_model`)** groups by `model`
+alone, deliberately **not** `(model, provider)` — the in-code comment explains why: grouping by both
+would split every model that has rows on both sides of the v9 migration boundary (pre-v9 rows carry
+`provider = NULL`) into two dashboard rows keyed the same on the frontend, and the dashboard's
+Alpine.js table keeps one DOM node per key, so the second row would silently overwrite the first
+one's numbers on screen. Each `ModelUsage` row now also carries `provider` (only when every row for
+that model agrees — `NULL` if the model was actually served by more than one provider),
+`turn_count` (`COUNT(DISTINCT turn_id)`, distinct from `call_count`), and `substitute_calls` (how
+many of the model's calls were substitutions for something else). Per-provider figures without this
+model-only-grouping ambiguity live in the `openfang_llm_*` Prometheus series instead (§9.4).
 
 ### 9.2 Proven on this box
 
@@ -796,12 +953,16 @@ instead of the 200 000 default.
 > it now meters every call at **$0.00**, and every USD budget/quota is therefore inert
 > (`GET /api/budget` → `hourly_spend: 0.0`, `daily_spend: 0.0`; `monthly_spend` still carries
 > `0.2386317` accumulated before the entry existed). Note the two surfaces differ: the metering
-> engine stores a literal `0.0`, but the `/message` response **drops the `cost_usd` key altogether**
-> — `kernel.rs:3022` only populates it when `cost > 0.0`, and `openfang-api/src/types.rs:60` marks
-> it `skip_serializing_if = "Option::is_none"`. A missing `cost_usd` therefore means "priced at
-> zero", not "nothing was spent". Put Hyperfusion's real per-million rates in that file if
-> you want meaningful cost numbers or a working `max_cost_per_hour_usd`. Re-read the file rather
-> than trusting this paragraph — another session mutates this instance.
+> engine stores a literal `0.0` per call (v9: one `usage_events` row per call, see §9.1b), but the
+> `/message` response **drops the `cost_usd` key altogether** — `kernel.rs:3041` sets it to
+> `Some(cost)` only when `cost > 0.0` **and** `[usage_footer]` mode is `Cost` or `Full`
+> (`UsageFooterMode::Off`/`Tokens` force it to `None` regardless of cost — `kernel.rs:3033-3044`),
+> and `openfang-api/src/types.rs` marks the field `skip_serializing_if = "Option::is_none"`. A
+> missing `cost_usd` therefore means "priced at zero, or the usage footer is off", not "nothing was
+> spent" — check `[usage_footer]` before concluding cost tracking is broken. Put Hyperfusion's real
+> per-million rates in that file if you want meaningful cost numbers or a working
+> `max_cost_per_hour_usd`. Re-read the file rather than trusting this paragraph — another session
+> mutates this instance.
 
 ### 9.3 Quotas
 
@@ -809,7 +970,34 @@ instead of the 200 000 default.
 `QuotaExceeded`. Global defaults come from `[budget]` via `apply_budget_defaults`
 (`kernel.rs:1692`).
 
----
+### 9.4 `GET /api/metrics` — five series, three questions (FANG-60)
+
+Verified live against this box (`curl -H "Authorization: Bearer $K" http://127.0.0.1:4200/api/metrics`).
+Do not read the first matching line and stop — two of these series look like they answer "how much
+did model X cost" and only one of them actually does.
+
+| Series | Type | Labels | What it answers | Source |
+|---|---|---|---|---|
+| `openfang_tokens_total` | gauge | `agent`, `provider`, `model` | Per-**agent** rolling-hourly token total across *all* models that agent used. **Frozen, on purpose**: `provider`/`model` describe the agent's *configuration*, not what actually served any given token — changing that would move an agent's tokens between series turn by turn and break `sum()`/`increase()` in Prometheus. | `routes.rs:3680-3681`; HELP text says so explicitly ("for per-model truth use openfang_llm_tokens_total") |
+| `openfang_tool_calls_total` | gauge | `agent` | Tool calls requested by the model, rolling hourly window, **counted per LLM response** (a response asking for 3 tool calls in parallel counts 3). Was **identically 0 before this fork** for lack of instrumentation — briefly counted "iterations that used a tool" instead, which undercounts whenever one response asks for more than one call. | `routes.rs:3682-3683` (HELP text states the history verbatim) |
+| `openfang_llm_calls_total` | counter | `agent`, `provider`, `model` | LLM calls **by the provider/model that actually served them** — the per-call truth `openfang_tokens_total`'s labels can't give you, monotonic since process start (resets only on daemon restart, which Prometheus already handles). | `routes.rs:3606-3611` |
+| `openfang_llm_tokens_total` | counter | `agent`, `provider`, `model`, `direction` (`input`/`output`) | Tokens by the provider/model that actually served them. | `routes.rs:3613-3621` |
+| `openfang_llm_fallback_calls_total` | counter | `agent`, `requested`, `served` | Calls served by a substitute model — only emitted for turns with an actual substitution, so an agent with a healthy primary emits no series for this metric at all (absence ≠ zero in the usual Prometheus sense; it means "never queried", not "queried and found zero"). | `routes.rs:3624-3630` |
+
+**Which one answers "which model burned the tokens this hour"?** `openfang_llm_tokens_total`, never
+`openfang_tokens_total` — the latter's labels are frozen to the agent's config and will lie about the
+model on any turn a fallback served. Verified live on this box: `AgentGemma4`'s
+`openfang_tokens_total{...,model="google/gemma-4-31b-it"}` reads `88267`, and its
+`openfang_llm_calls_total{...,model="google/gemma-4-31b-it"}` reads `5` calls for `88267` combined
+input+output tokens — consistent here only because that agent has never fallen back; the two series
+are not guaranteed to reconcile for an agent that has.
+
+`render_agent_usage_metrics()` (`routes.rs:3585`) and `render_llm_call_metrics()` (`routes.rs:3601`)
+are split out from the main handler (`prometheus_metrics`, `routes.rs:3647`) specifically so a test
+can pin the exact label set — the doc-comment on `render_agent_usage_metrics` names the regression
+class this guards against: a label set changing between two scrapes of the *same* series makes
+Prometheus treat it as a new series and starts the old one's counter over from the scraper's point of
+view, silently truncating history.
 
 ## 10. Model routing
 
@@ -999,7 +1187,7 @@ priority list of env vars and **overwrites `config.default_model`** in memory if
 | Fallback does **not** failover on 429/529 | it does failover on every error | `fallback.rs:46-66` |
 | `fallback_models = ["a","b"]` | array of `{provider, model}` tables | `agent.rs:407,443` |
 | `[routing]` in `config.toml` | agent-manifest field only | `agent.rs:470`; no `routing` in `KernelConfig` |
-| Cost-rate pattern table | dead code; catalog-only + $1/$3 fallback | `metering.rs:197`, no callers of `estimate_cost` |
+| Cost-rate pattern table | dead code; catalog-only + $1/$3 fallback | `crates/openfang-kernel/src/metering.rs:283` (line moved this fork; the file did not) |
 | Module comment: "130+ models across 28 providers" | 205 / 42 | `model_catalog.rs:3` |
 | `[provider_urls]`, `[provider_api_keys]` | exist and are important | undocumented anywhere in `docs/` |
 
@@ -1011,7 +1199,7 @@ priority list of env vars and **overwrites `config.default_model`** in memory if
 |---|---|---|---|
 | **#1195** | OpenAI-compatible custom base_url strips `openai/` from Featherless model IDs | OPEN | **Real, unfixed, root cause = `agent_loop.rs:212`.** Reproduces whenever the model id starts with `"{provider}/"`. Reporter's workaround is explained exactly by the code. **Does not affect us** (provider `hyperfusion`) — proven by a discriminating upstream probe. |
 | **#1149** | Migrate OpenAI support to Responses API | OPEN | Accurate. `OpenAIDriver` is Chat Completions only — `chat_url()` (`openai.rs:79`) hard-codes `/chat/completions`; no `/responses` anywhere. Nothing started. |
-| **#995** | Add Requesty as a Provider | OPEN | **Stale — already implemented.** `requesty` exists in the catalog (`model_catalog.rs:629`, 5 models, `https://router.requesty.ai/v1`) and in `provider_defaults` (`drivers/mod.rs:109`). `metering.rs:237` even has a Requesty pricing block citing #995. Should be closed. Caveat: `POST /api/providers/requesty/test` will still fail because the default model id `requesty/anthropic/claude-sonnet-4` is sent unstripped ([§11.2](#112-post-apiprovidersnametest-caveats)). |
+| **#995** | Add Requesty as a Provider | OPEN | **Stale — already implemented.** `requesty` exists in the catalog (`model_catalog.rs:629`, 5 models, `https://router.requesty.ai/v1`) and in `provider_defaults` (`drivers/mod.rs:109`). `crates/openfang-kernel/src/metering.rs:323` even has a Requesty pricing block citing #995. Should be closed. Caveat: `POST /api/providers/requesty/test` will still fail because the default model id `requesty/anthropic/claude-sonnet-4` is sent unstripped ([§11.2](#112-post-apiprovidersnametest-caveats)). |
 | **#981** | MiniMax Coding Plan fails with Auth 401 | OPEN | **Real.** `minimax` is wired to `OpenAIDriver` via `provider_defaults` (`drivers/mod.rs:234`) at `https://api.minimax.io/v1`. The reported error body (`{"type":"error","error":{"type":"authorized_error",…}}`) is **Anthropic-shaped**, i.e. the Coding Plan endpoint speaks the Anthropic protocol. OpenFang has `zhipu_coding`, `zai_coding`, `kimi_coding` and `volcengine_coding` variants — and `kimi_coding` is explicitly routed to `AnthropicDriver` (`drivers/mod.rs:509-522`) — but there is **no `minimax_coding` provider**. That missing sibling is the gap. |
 | **#1033** | Support OpenAI Codex App Server as a model backend | OPEN | Accurate. The existing `codex` provider is *not* this: it is `OpenAIDriver` against `https://api.openai.com/v1`, keyed by `OPENAI_API_KEY` or a credential scraped from the Codex CLI (`read_codex_credential`, `model_catalog.rs:525`). No app-server subprocess, no stdio handshake, no ChatGPT login flow. |
 
@@ -1056,7 +1244,7 @@ lookup, `model_catalog.rs:199`), **#845** (per-agent `fallback_models`, `agent_l
    `hyperfusion` is absent from the 42-entry list, so the dashboard, `/models` availability flags,
    and `POST …/test` all behave as if it doesn't exist. Register it in `[provider_urls]` to fix.
 
-6. **Unknown model ⇒ $1.00/$3.00 per M invented pricing** (`metering.rs:203`), which is ~10× off for
+6. **Unknown model ⇒ $1.00/$3.00 per M invented pricing** (`crates/openfang-kernel/src/metering.rs:289`), which is ~10× off for
    `gpt-oss-120b`. Quotas and the usage footer are enforced/printed against that fiction. The
    documented pattern-matching rate table never executes — `estimate_cost` has no non-test callers.
 

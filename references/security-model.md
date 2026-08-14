@@ -31,15 +31,15 @@ for an **LLM agent** (the normal case) are much fewer. Map of reality:
 | Layer | Enforced for LLM agents? | Enforced for WASM agents? | Where |
 |---|---|---|---|
 | `Capability` enum / `CapabilityManager` | **No** (only feeds the tool-list filter) | **Yes**, deny-by-default per host call | `openfang-kernel/src/capabilities.rs`, `openfang-runtime/src/host_functions.rs` |
-| `capabilities.tools` allowlist | Yes — becomes `allowed_tools` at dispatch | n/a | `kernel.rs:6137` → `agent_loop.rs:839` → `tool_runner.rs:133` |
+| `capabilities.tools` allowlist | Yes — becomes `allowed_tools` at dispatch | n/a | `kernel.rs:6303` → `agent_loop.rs:1009` → `tool_runner.rs:133` |
 | `tool_allowlist` / `tool_blocklist` | Yes (post-filter on the tool list) | n/a | `kernel.rs:6283-6310` |
-| `profile` (ToolProfile) | Yes (only when `capabilities.tools` is empty) | n/a | `kernel.rs:6205-6218` |
+| `profile` (ToolProfile) | Yes (only when `capabilities.tools` is empty) | n/a | `kernel.rs:6356-6384` |
 | Approval gate | Yes, `shell_exec` only by default | **No** (WASM host calls never hit it) | `tool_runner.rs:146-197` |
 | `exec_policy` (metachar + allowlist) | Yes, `shell_exec` / `process_start` only | No | `subprocess_sandbox.rs:126,329` |
 | Taint sinks | Yes, two heuristic call sites only | No | `tool_runner.rs:37,63` |
 | WASM fuel + epoch | n/a | Yes | `sandbox.rs:178-191` |
 | WASM `max_memory_bytes` | n/a | **No — never wired** (#1242) | `sandbox.rs:38` |
-| Capability inheritance (anti-escalation) | **No — LLM `agent_spawn` bypasses it** | Yes | `kernel.rs:7835`, `tool_runner.rs:1824` |
+| Capability inheritance (anti-escalation) | **No — LLM `agent_spawn` bypasses it** | Yes | `kernel.rs:8027`, `tool_runner.rs:1863` |
 | `openfang-runtime/src/tool_policy.rs` (478 lines) | **Dead code — zero callers** | — | see §3.7 |
 | Merkle audit chain | Yes (writes), read API partially public | Yes | `openfang-runtime/src/audit.rs` |
 | Bearer / dashboard auth | Yes, with a large public-GET surface + one real bypass | — | `openfang-api/src/middleware.rs` |
@@ -143,7 +143,7 @@ Multiple stars beyond the first are not handled — `"a*b*c"` is treated as pref
 
 Variants that are **never constructed anywhere in the workspace**: `NetListen`, `LlmQuery`,
 `LlmMaxTokens`, `AgentKill`, `OfpAdvertise`, `EconSpend`, `EconEarn`, `EconTransfer`.
-`manifest_to_capabilities()` (`kernel.rs:6757`) can only emit `NetConnect`, `ToolInvoke`,
+`manifest_to_capabilities()` (`kernel.rs:6948`) can only emit `NetConnect`, `ToolInvoke`,
 `MemoryRead`, `MemoryWrite`, `AgentSpawn`, `AgentMessage`, `ShellExec`, `OfpDiscover`,
 `OfpConnect`. `ToolAll`, `FileRead`, `FileWrite`, `EnvRead` are **unreachable from any manifest**
 — you cannot grant them in TOML.
@@ -166,7 +166,7 @@ ofp_connect   = []
 ```
 
 All list fields go through `serde_compat::vec_lenient`, so a bare string is accepted where a list
-is expected. `profile` expansion (`manifest_to_capabilities`, `kernel.rs:6759-6793`): if a
+is expected. `profile` expansion (`manifest_to_capabilities`, `kernel.rs:6950-6985`): if a
 `profile` is set **and** `capabilities.tools` is empty, the profile's implied capabilities become
 the base and each non-empty manifest field overrides its counterpart. If `tools` is non-empty the
 profile contributes nothing to capabilities.
@@ -174,17 +174,25 @@ profile contributes nothing to capabilities.
 ### 2.2 What the kernel does with the grants
 
 `CapabilityManager` (`openfang-kernel/src/capabilities.rs`) is a `DashMap<AgentId, Vec<Capability>>`
-with `grant` / `check` / `list` / `revoke_all`. Grants happen at spawn (`kernel.rs:1717-1719`),
-on config re-sync (`kernel.rs:1370-1372`) and are dropped on kill (`kernel.rs:3724`).
+with `grant` / `check` / `list` / `revoke_all`. Grants happen at spawn (`kernel.rs:1747-1749`),
+on config re-sync (`kernel.rs:1400-1402`) and are dropped on kill (`kernel.rs:3792`).
 
-`CapabilityManager::check()` has **exactly zero callers** outside its own unit tests. `list()` is
-called in two places: the WASM sandbox config (`kernel.rs:2509`) and the `has_tool_all` computation
-in `available_tools_with_registry` — where the match arms are:
+`CapabilityManager::check()` has **exactly zero callers** outside its own unit tests. `list()` has
+**exactly one caller** in the whole workspace — the `has_tool_all` computation in
+`available_tools_with_registry` (`kernel.rs:6359`) — where the match arms are:
 
 ```rust
 _ if has_tool_all => all_builtins,
-_ => all_builtins,          // kernel.rs:6216-6217 — identical, so ToolAll is a no-op
+_ => all_builtins,          // kernel.rs:6381-6382 — identical, so ToolAll is a no-op
 ```
+
+**Correction to an earlier pass of this file, which said `list()` had two callers** (this one plus
+the WASM sandbox config): grepping `\.capabilities\.list\(` across the workspace now finds exactly
+one hit. `execute_wasm_agent` (`kernel.rs:2516-2542`) builds the WASM `SandboxConfig.capabilities`
+by calling `manifest_to_capabilities(&entry.manifest)` directly (`kernel.rs:2535`) — it re-derives
+capabilities from the manifest fresh rather than reading back what `CapabilityManager::grant`
+stored for that agent at spawn. Both paths run the same `manifest_to_capabilities()`, so they agree
+in practice; the point is that `CapabilityManager::list()` itself is not on the WASM path at all.
 
 ---
 
@@ -213,7 +221,7 @@ Each handler calls `check_capability(&state.capabilities, &required)` first — 
 
 ### 3.2 LLM agents — the tool list is the capability
 
-`OpenFangKernel::available_tools_with_registry` (`kernel.rs:6146-6320`) builds the list handed to
+`OpenFangKernel::available_tools_with_registry` (`kernel.rs:6314-6487`) builds the list handed to
 the model, in order:
 
 1. builtins (minus `browser_*` when `[browser] enabled = false`);
@@ -224,7 +232,7 @@ the model, in order:
 5. `manifest.tool_allowlist` retain / `manifest.tool_blocklist` remove (case-insensitive);
 6. `shell_exec` removed if the effective `exec_policy.mode == deny`.
 
-`agent_loop.rs:839` then flattens that to `allowed_tool_names` and passes it to
+`agent_loop.rs:914,1009` then flattens that to `allowed_tool_names` and passes it to
 `tool_runner::execute_tool(..., allowed_tools, ...)`, which rejects anything not in the list
 (`tool_runner.rs:132-143`, "Permission denied: agent does not have capability to use tool 'x'").
 Tool names are first normalised through `normalize_tool_name()` (compat aliases such as
@@ -277,11 +285,11 @@ tool. Blocklist it or add it to `require_approval`.
 
 - `validate_capability_inheritance(parent, child)` (`capability.rs:171`) requires every child
   capability to be covered by a parent grant.
-- `spawn_agent_checked()` (`kernel.rs:7835-7862`) parses the child manifest, derives its caps and
+- `spawn_agent_checked()` (`kernel.rs:8027-8050`) parses the child manifest, derives its caps and
   runs that check. Its **only** caller is `host_agent_spawn` (`host_functions.rs:415`).
 - The LLM-facing tool `agent_spawn` calls `tool_agent_spawn` → `kh.spawn_agent(manifest_toml,
-  parent_id)` (`tool_runner.rs:1824`) — the *unchecked* path. `spawn_agent` grants whatever
-  `manifest_to_capabilities()` derives (`kernel.rs:1717-1719`) with no parent comparison.
+  parent_id)` (`tool_runner.rs:1863`) — the *unchecked* path. `spawn_agent` grants whatever
+  `manifest_to_capabilities()` derives (`kernel.rs:1747-1749`) with no parent comparison.
 - `/api/security` nevertheless reports `"privilege_escalation_prevention": true` [verified live].
 
 Mitigation: keep `agent_spawn` out of `capabilities.tools` / put it in `tool_blocklist` for any
@@ -294,7 +302,7 @@ This is the only depth limiter that runs.
 
 ### 3.6b `POST /mcp` executes tools with **no** agent context — no tool list, no exec_policy, no workspace
 
-`mcp_http` (`routes.rs:7017-7112`) is the one place `tool_runner::execute_tool` is called outside an
+`mcp_http` (`routes.rs:7216-7311`) is the one place `tool_runner::execute_tool` is called outside an
 agent loop, and it passes almost every security parameter as `None`:
 
 ```rust
@@ -343,8 +351,8 @@ nowhere**. There is no `[tool_policy]` config section. Do not plan around it.
 `max_cost_per_{hour,day,month}_usd` **are** enforced (`openfang-kernel/src/metering.rs:27`).
 
 **`max_llm_tokens_per_hour` IS enforced** (an earlier pass of this file said otherwise): agents
-register with the scheduler at spawn (`kernel.rs:1721-1722`), and `scheduler.check_quota()` runs
-**before every turn** (`kernel.rs:1910` and `:1997`), erroring out via
+register with the scheduler at spawn (`kernel.rs:1751-1753`), and `scheduler.check_quota()` runs
+**before every turn** (`kernel.rs:1941` and `:2032`), erroring out via
 `crates/openfang-kernel/src/scheduler.rs:91-96`. Caveat worth knowing: the rolling token window is an
 in-memory `DashMap` keyed on `Instant`, so **it resets on every daemon restart** — the quota is real
 but not durable.
@@ -368,7 +376,7 @@ but not durable.
   It is **display metadata only** — nothing gates on `RiskLevel`.
 - `ApprovalRequest::validate()` (tool name ≤64 alphanum/underscore, description ≤1024,
   action_summary ≤512, timeout 10..=300) exists but is **not called** on the kernel-generated
-  request path (`kernel.rs:7576-7607` builds the struct and submits it directly).
+  request path (`kernel.rs:7767-7800` builds the struct and submits it directly).
 
 ### 4.2 The gate in the tool path
 
@@ -393,7 +401,7 @@ On deny/timeout the tool returns
 
 | Bypass | Where |
 |---|---|
-| Agent tagged `hand:*` → **every** approval auto-granted, silently | `kernel.rs:7584-7592` |
+| Agent tagged `hand:*` → **every** approval auto-granted, silently | `kernel.rs:7776-7784` |
 | `exec_policy.mode = "full"` (or `allowlist` + `allowed_commands = ["*"]`) → `shell_exec`/`process_start` skip the gate (#772) | `tool_runner.rs:152-158` |
 | WASM host calls never consult the approval manager at all | `host_functions.rs` |
 | `docker_exec`, `browser_run_js`, `file_write`, `apply_patch` … are not in the default require list | `approval.rs:188` |
@@ -694,13 +702,23 @@ sites is:
 
 | Site | Action |
 |---|---|
-| `kernel.rs:1241`, `:1253` | `ConfigChange` — HAND.toml load / reload SHA-256 |
-| `kernel.rs:1760-1762` (`spawn_agent_with_parent`) | **`AgentSpawn`** |
-| `kernel.rs:1947-1949`, `:1961-1963` (`send_message`, ok and err) | **`AgentMessage`** |
-| `kernel.rs:3740-3742` (`kill_agent`) | **`AgentKill`** |
-| `routes.rs:123` | `AuthAttempt` — dashboard login (only when `[auth]` is enabled) |
-| `routes.rs:891`, `:10976`, `:11231`, `:12564` | `ConfigChange` — config/dashboard writes |
-| `routes.rs:3809-3825` | whatever `POST /api/audit/append` was told, defaulting to `ToolInvoke` |
+| `kernel.rs:1272`, `:1284` | `ConfigChange` — HAND.toml load / reload SHA-256 |
+| `kernel.rs:1790` (`spawn_agent_with_parent`) | **`AgentSpawn`** |
+| `kernel.rs:1981`, `:1995` (`send_message`, ok and err) | **`AgentMessage`** |
+| `kernel.rs:3808` (`kill_agent`) | **`AgentKill`** |
+| `routes.rs:123` | `AuthAttempt` — **not** dashboard login: fires on a failed Ed25519 signature check on a `signed_manifest` passed to `POST /api/agents`, regardless of whether `[auth]` is enabled at all |
+| `routes.rs:12782`, `:12811` | `AuthAttempt` — dashboard login, fail and success (`auth_login`, only reachable when `[auth].enabled`, which 404s the route otherwise) |
+| `routes.rs:897`, `:11175`, `:11449` | `ConfigChange` — config/dashboard writes (`shutdown`, `config_reload`, dashboard config-set) |
+| `routes.rs:3974-3995` | whatever `POST /api/audit/append` was told, defaulting to `ToolInvoke` |
+
+**Correction to an earlier pass of this file:** it listed `routes.rs:123` as "dashboard login" and
+claimed **four** `ConfigChange` sites in `routes.rs` (`:891`, `:10976`, `:11231`, `:12564`). Neither
+holds up against the current tree: `:123` is a manifest-signature failure inside agent spawn, not
+login (the real login `AuthAttempt` sites are `:12782`/`:12811`, found by grepping every
+`audit_log.record(` call in `routes.rs` — six total, three `AuthAttempt`, three `ConfigChange`),
+and there are only **three** `ConfigChange` sites in `routes.rs`, not four — grep
+`audit_log\.record\(` in `routes.rs` to reproduce. Whether the fourth site was refactored away or
+the original count was simply wrong could not be determined from this tree alone.
 
 **Genuinely never emitted by the runtime:** `ToolInvoke`, `ShellExec`, `CapabilityCheck`,
 `FileAccess`, `NetworkAccess`, `MemoryAccess`, `WireConnect` — they exist only as `AuditAction`
@@ -715,13 +733,13 @@ variants reachable through `/api/audit/append`. So you get an **agent-lifecycle*
 `HandRegistry` gained `audit_callback` + `emit_hand_loaded_audit()`
 (`openfang-hands/src/registry.rs:61-101`), invoked from all five load/upsert/reload sites
 (`:164,226,258,306,325`). The kernel backfills bundled hands at boot and installs the callback
-(`kernel.rs:1225-1257`), emitting
+(`kernel.rs:1255-1288`), emitting
 `HAND.toml load hand=<id> sha256=<hex>` and `HAND.toml reload hand=<id> sha256=<hex>` as
 `ConfigChange`/`ok`. [verified live — both forms present in the chain]
 
 ### 10.3 #1174 — `POST /api/audit/append`: **implemented in v0.6.9** (issue still open upstream)
 
-Route registered at `server.rs:398-401`, handler `routes::audit_append` (`routes.rs:3777-3872`).
+Route registered at `server.rs:398-401`, handler `routes::audit_append` (`routes.rs:3944-4041`).
 
 ```bash
 curl -s -X POST http://127.0.0.1:4200/api/audit/append \
@@ -739,7 +757,7 @@ The response shape differs slightly from the issue's proposal (adds `status` and
 Read side: `GET /api/audit/recent?n=N` and `GET /api/audit/verify`
 (`{"entries":N,"tip_hash":"…","valid":true}`), both auth-required.
 
-> **The query parameter is `n`, not `limit`** (`routes.rs:5249-5253`: `params.get("n")`, default
+> **The query parameter is `n`, not `limit`** (`routes.rs:5416-5420`: `params.get("n")`, default
 > **50**, `.min(1000)`). `?limit=500` is silently ignored and you get 50 rows — verified live:
 > `?limit=500` → 50 entries, `?n=500` → 201 entries. Any pagination you build on `limit` will
 > silently truncate your export.
@@ -747,7 +765,7 @@ Read side: `GET /api/audit/recent?n=N` and `GET /api/audit/verify`
 ### 10.4 …but the chain is readable without auth
 
 `GET /api/logs/stream` is in the public list (`middleware.rs:135`) and its handler
-(`routes.rs:5321-5400`) polls `audit_log.recent(200)` every second and SSEs
+(`routes.rs:5488-5571`) polls `audit_log.recent(200)` every second and SSEs
 `{seq,timestamp,agent_id,action,detail,outcome,hash}` — the same rows `/api/audit/recent` protects.
 [verified live: `curl -N http://127.0.0.1:4200/api/logs/stream` with no credentials streams the chain.]
 Supports `?level=` and `?filter=` query filters.
@@ -765,7 +783,7 @@ Two independent mechanisms, both handled by one middleware (`openfang-api/src/mi
    and also returns the token in the JSON body. Token format
    `base64("<username>:<expiry_unix>:<hmac_sha256_hex>")` (`session_auth.rs:10-18`), verified with a
    constant-time compare and an expiry check. **Session secret = `api_key` if non-empty, else
-   `password_hash`** (`server.rs:147-155`, mirrored in `routes.rs:12579-12586` and `ws.rs:328-335`).
+   `password_hash`** (`server.rs:147-155`, mirrored in `routes.rs:12856-12862` and `ws.rs:328-335`).
    Both login outcomes are written to the audit chain as `AuthAttempt`.
 
 `openfang auth hash-password` (`main.rs:6294-6314`) prompts twice, calls
@@ -968,7 +986,7 @@ again — a classic TOCTOU/DNS-rebinding window. Also `mcp.rs:329` has a *second
    silently renders empty against a keyed daemon.
 3. **`[approval] auto_approve = true` does nothing** (§4.4). Use `require_approval = false`.
    The runtime's own error message tells users to do the thing that does not work.
-4. **Any agent tagged `hand:*` auto-approves every gated tool** (`kernel.rs:7584-7592`), silently,
+4. **Any agent tagged `hand:*` auto-approves every gated tool** (`kernel.rs:7776-7784`), silently,
    with only an `info!` line.
 5. **Approval fires before validation** (#1180 B): operators are asked to approve commands that
    the metacharacter/allowlist checks will reject anyway.
@@ -1001,7 +1019,7 @@ again — a classic TOCTOU/DNS-rebinding window. Also `mcp.rs:329` has a *second
 13. **`tool_policy.rs` is dead code** (§3.7) — no `[tool_policy]` section exists.
 14. **`max_memory_bytes` (#1242), `max_tool_calls_per_minute` and `max_network_bytes_per_hour` are
     configured but unenforced.** USD cost quotas bite, **and so does `max_llm_tokens_per_hour`** —
-    `scheduler.check_quota()` runs before every turn (`kernel.rs:1910`, `:1997`;
+    `scheduler.check_quota()` runs before every turn (`kernel.rs:1941`, `:2032`;
     `openfang-kernel/src/scheduler.rs:91-96`), but its window is in-memory and resets on daemon restart.
 15. **WASM watchdog threads live for the full 30 s after every execution** (#1241); WASM timeout is
     hard-coded to 30 s (`kernel.rs:2514`), not configurable.
@@ -1036,6 +1054,23 @@ again — a classic TOCTOU/DNS-rebinding window. Also `mcp.rs:329` has a *second
     curl -s -H "Authorization: Bearer $K" http://127.0.0.1:4200/api/security | jq .configurable.auth
     # healthy -> {"api_key_set":true,"mode":"bearer_token"}
     ```
+26. **Three credential leaks that existed under stock v0.6.9 are closed in this fork (FANG-39/43/
+    44) — no CVE, no upstream issue number.** Telegram's bot token reached the LLM prompt and the
+    on-disk session (embedded in the file/voice download URL, formatted straight into
+    `[User sent a file (...): <url>]` text) and reached logs via unredacted `reqwest::Error`; six
+    more adapters (`dingtalk`, `messenger`, `flock`, `threema`, `wecom`, `gotify`) leaked their own
+    credential the same way via `reqwest::Error`; and a raw provider error body (which can quote a
+    rejected key) reached `fallback.reason`/`calls[].reason` in API responses unredacted. Full
+    detail and file:line citations: `channels-mcp-api.md` §1.8a/§1.8b. **Action, not just
+    awareness:** if this instance ever ran the stock build, every channel bot token and every
+    provider API key that was ever rejected once is compromised — rotate them. The fix stops future
+    leaks; it does not un-leak anything already written to a log or a session file.
+27. **Model/provider/fallback disclosure landed on four response surfaces, one of them only
+    partially** (FANG-57) — `/api/agents/{id}/message`, the `/message/stream` SSE `call` event, the
+    agent WebSocket, and non-streaming `/v1/chat/completions` (as a `"openfang"` vendor-extension
+    object). **Streaming `/v1/chat/completions` does not carry it** — `StreamEvent::CallReported`
+    has no arm in that forwarder and is silently dropped. Full shapes and citations:
+    `channels-mcp-api.md` §4.6.
 
 ---
 

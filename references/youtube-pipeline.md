@@ -266,8 +266,14 @@ each, all `ok`. No cookies, no proxy, no `--sleep-requests` needed. That said,
 | Lex Fridman #499, `XyXBwO5jYpw` | **3:46:18** | **4,307,148 bytes** | **222,162 chars** | **~55.5k** | **3 s** |
 
 The json3 is ~19× the size of the text it contains. **Never `file_read` a json3.**
-`tool_file_read` (`tool_runner.rs:1379-1388`) is a bare `read_to_string` with no size
-limit and no truncation — a 4.3 MB tool result would be handed straight to the model.
+`tool_file_read` (`tool_runner.rs:1381-1433`) is still a bare `read_to_string` — it reads
+the whole file into memory regardless of what you ask for — but it now accepts
+`offset`/`limit` and, when the requested window is not the whole file, prepends an
+honest `[file_read: returned bytes N-M of TOTAL total …; call again with offset=M to
+continue]` header instead of staying silent. A plain call with neither argument still
+returns the entire file with no truncation of its own, so a 4.3 MB json3 read in one
+call is still handed straight to the model (and then silently cut by the unrelated
+30%-of-context-window tool-result cap, not by `file_read` itself).
 
 ### 2.6 The one real network failure, and its fix
 
@@ -619,8 +625,12 @@ def cmd_fetch(a):
         os.remove(src)
 
     # Split into parts small enough to survive OpenFang's per-tool-result cap
-    # (30% of the context window x 2 chars/token). file_read returns the WHOLE
-    # file, so a 220k-char transcript would be silently truncated mid-way.
+    # (30% of the context window x 2 chars/token). file_read now takes offset/limit,
+    # but a plain call with neither still returns the WHOLE file with no automatic
+    # truncation of its own -- and the outer per-tool-result cap that DOES truncate
+    # applies silently regardless, so a 220k-char transcript read in one call would
+    # still be cut mid-way with no notice. Pre-splitting stays the deterministic fix;
+    # it doesn't depend on the agent remembering to page with offset/limit itself.
     parts = []
     if a.chunk_chars > 0 and len(text) > a.chunk_chars:
         buf, size, idx = [], 0, 1
@@ -1027,7 +1037,7 @@ exact id was **not in the model catalog** — the only near match was
 
    (`context_budget.rs:34-50`; applied at `agent_loop.rs:989` and `:2198`.)
 
-2. **Every cost figure was fabricated.** `metering.rs:203`:
+2. **Every cost figure was fabricated.** `metering.rs:289`:
    `let (input_per_m, output_per_m) = catalog.pricing(model).unwrap_or((1.0, 3.0));`
    A run reporting `cost_usd: 0.120373` was just `109861×$1/M + 3504×$3/M`. Real
    Hyperfusion pricing for gpt-oss-120b is an order of magnitude lower, so the
@@ -1154,7 +1164,7 @@ observed failure:
   wraps the whole tool call in `TOOL_TIMEOUT_SECS = 120` (`agent_loop.rs:47`) and the shorter of the
   two wins. Earlier versions of this prompt said 240, which was silently unreachable. The deployed
   `/data/hands/youtube-insights/HAND.toml` still carries the old 240 — run
-  `ofhand install ~/.claude/skills/openfang/assets/youtube-insights-hand` to sync it (that restarts
+  `ofhand install ~/.claude/skills/fang-upgrade/assets/youtube-insights-hand` to sync it (that restarts
   the container). `ytwatch.py`'s own `--timeout 240` default is bounded by the same 120 s wrapper;
 - "never `file_read` a `.json3`";
 - "URLs containing `&` are blocked — use the bare video id";
@@ -1242,8 +1252,11 @@ Everything here was hit and confirmed on this box, not read in a doc.
 
 **Tools and context**
 
-12. **`file_read` has no size limit and no truncation** (`tool_runner.rs:1385`). One
-    call on a 4.3 MB json3 would put the whole thing in the request.
+12. **`file_read` reads the whole file into memory regardless of `offset`/`limit`**
+    (`tool_runner.rs:1387`, still a bare `read_to_string`). A plain call with neither
+    argument returns the whole file, no truncation, no header — one call on a 4.3 MB
+    json3 would put the whole thing in the request. `offset`/`limit` exist for paging a
+    known-large file on purpose; they don't shrink what gets read off disk.
 13. **Tool results are capped at 30% of the context window** and compacted at 75%
     total. Chunk long transcripts into ≤60 KB parts and process one at a time.
 14. **20 messages of history, not configurable for hands.** `max_history_messages`

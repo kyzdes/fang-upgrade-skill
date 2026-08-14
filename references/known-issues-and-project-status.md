@@ -7,6 +7,21 @@ Every claim below is either (a) a direct quote of an issue/PR, or (b) verified b
 source at the cited `file:line`. Where the issue text and the v0.6.9 code **disagree**, the code wins
 and the disagreement is called out explicitly.
 
+**Prod no longer runs this checkout.** Since 2026-08-09, `http://127.0.0.1:4200` runs our fork
+(`/root/src/openfang`, branch `ours`) three sprints ahead of `acf2587e`, not the bare tag. The
+triage below still describes real upstream behavior — none of the 73 issues or 45 PRs surveyed
+here overlap with what the fork changed (checked by keyword against every fix in `FORK-NOTES.md`:
+per-call metering/`model_used`/`fallback`, the fallback `base_url` fix, prompt-section tags,
+`PUT /agents/{id}/update` honesty, `remove_custom_model`'s `model_count`, hot-reload's
+applied-vs-deferred split, the Telegram token leaks, six adapters' `reqwest`-error leaks,
+`file_read` paging, and `openfang_tool_calls_total` — none is a numbered issue or PR title in this
+tracker). So every row here is still an accurate description of a gap you'd hit on the fork too,
+**except** wherever a `file:line` citation points into `tool_runner.rs`, `agent_loop.rs`,
+`routes.rs`, or `kernel.rs` — those four files carry the fork's edits, so their line numbers below
+have been re-verified against `/root/src/openfang` on `ours` (not the untouched `acf2587e` tree)
+and updated where the fork's insertions shifted them. Citations into any other file are unchanged
+from the original `acf2587e` research and still point at the bare-tag checkout at `/opt/openfang`.
+
 Reproduce the raw data with:
 
 ```bash
@@ -259,7 +274,7 @@ project at large. Ratings:
 
 #### #1252 — what the v0.6.9 code actually does (issue text is misleading)
 
-The config key **is** wired: `crates/openfang-kernel/src/kernel.rs:4839-4841` builds
+The config key **is** wired: `crates/openfang-kernel/src/kernel.rs:4961-4963` builds
 `HeartbeatConfig { default_timeout_secs: self.config.heartbeat.default_timeout_secs, ..default() }`,
 and `crates/openfang-types/src/config.rs:1303-1322` defines `[heartbeat] default_timeout_secs` with
 a **default of 180**, not 60.
@@ -305,7 +320,7 @@ message (fix for #844); and `should_exempt_idle_reactive_agent` (`heartbeat.rs:1
 
 | # | Title | Sev | Impact | Workaround |
 |---|---|---|---|---|
-| **#1192** | Deleted workflow reappears after daemon restart | **HIGH** | Confirmed: `crates/openfang-kernel/src/workflow.rs:235-238` — `remove_workflow()` is `self.workflows.write().await.remove(&id).is_some()` and **never touches disk**. `load_workflows_from_dir()` (`kernel.rs:4634-4650`) re-imports every `.json` at boot. A workflow you "deleted" (possibly a scheduled, cost-incurring one) comes back. | After deleting in the UI, `rm $OPENFANG_HOME/workflows/<id>.json` **before** restarting. Fix exists as unmerged PR **#1193**. |
+| **#1192** | Deleted workflow reappears after daemon restart | **HIGH** | Confirmed: `crates/openfang-kernel/src/workflow.rs:235-238` — `remove_workflow()` is `self.workflows.write().await.remove(&id).is_some()` and **never touches disk**. `load_workflows_from_dir()` (`kernel.rs:4468-4484`) re-imports every `.json` at boot. A workflow you "deleted" (possibly a scheduled, cost-incurring one) comes back. | After deleting in the UI, `rm $OPENFANG_HOME/workflows/<id>.json` **before** restarting. Fix exists as unmerged PR **#1193**. |
 | **#1253** | `collect` joins pre-fan-out outputs, not just the preceding fan-out group | **MED** | Confirmed: `workflow.rs:635-638` — `StepMode::Collect => { current_input = all_outputs.join("\n\n---\n\n"); all_outputs.clear(); all_outputs.push(current_input) }`. `all_outputs` is the *global* buffer (declared L469, pushed at L515/L595/L689/L780), so earlier `Sequential` outputs are folded into the merge. Contradicts `docs/workflows.md`. Downstream synthesis steps silently receive stale context; multi-phase workflows keep carrying it forward. | Insert a no-op transform step, or put fan-out groups in separate workflows and chain them. Fix exists as unmerged PR **#1277**. |
 | **#739** | Scheduler entries not editable after creation in the web UI | LOW | Delete + recreate only. | Edit the on-disk definition and restart, or use the CLI/API. |
 | **#1194** | Proposal: PR-Reviewer Hand (autonomous review + CI monitoring) | LOW | Feature proposal, no code. | — |
@@ -314,9 +329,9 @@ message (fix for #844); and `should_exempt_idle_reactive_agent` (`heartbeat.rs:1
 
 | # | Title | Sev | Impact | Workaround |
 |---|---|---|---|---|
-| **#1212** | Embedding driver hard-codes 6 cloud providers; `base_url` override ignored | **HIGH** if you use memory-recall | **This is the real one.** The *chat* path honours `OLLAMA_HOST`/`OLLAMA_BASE_URL`, `LMSTUDIO_*`, `VLLM_*`, `LEMONADE_*` and `[provider_urls]` (`model_catalog.rs:340-360`, `drivers/mod.rs:52-82`). The *embedding* path does not honour `[provider_urls]`/`base_url`. Precisely (this is narrower than the issue's phrasing): `[memory] embedding_provider` wins if set (`kernel.rs:981`); otherwise `kernel.rs:1007-1014` tries six cloud key env vars **in priority order** — `OPENAI_API_KEY → GROQ_API_KEY → MISTRAL_API_KEY → TOGETHER_API_KEY → FIREWORKS_API_KEY → COHERE_API_KEY` — and only if **none** is set does it fall through to local `ollama → vllm → lmstudio` (`kernel.rs:1044-1046`). **Net effect: on a box that has `OPENAI_API_KEY` set for any other reason, chat stays local while embedding-recall silently ships your text to api.openai.com and bills you.** The hole is the priority order, not an absolute requirement. | Disable embedding-recall, or front a local embedding server with a reverse proxy at `https://api.openai.com`-shaped routing, or patch `embedding.rs`. Partial fixes in unmerged PRs **#1248** and **#997** (native Gemini embeddings). |
+| **#1212** | Embedding driver hard-codes 6 cloud providers; `base_url` override ignored | **HIGH** if you use memory-recall | **This is the real one.** The *chat* path honours `OLLAMA_HOST`/`OLLAMA_BASE_URL`, `LMSTUDIO_*`, `VLLM_*`, `LEMONADE_*` and `[provider_urls]` (`model_catalog.rs:340-360`, `drivers/mod.rs:52-82`). The *embedding* path does not honour `[provider_urls]`/`base_url`. Precisely (this is narrower than the issue's phrasing): `[memory] embedding_provider` wins if set (`kernel.rs:1012`); otherwise `kernel.rs:1040-1047` tries six cloud key env vars **in priority order** — `OPENAI_API_KEY → GROQ_API_KEY → MISTRAL_API_KEY → TOGETHER_API_KEY → FIREWORKS_API_KEY → COHERE_API_KEY` — and only if **none** is set does it fall through to local `ollama → vllm → lmstudio` (`kernel.rs:1074-1076`). **Net effect: on a box that has `OPENAI_API_KEY` set for any other reason, chat stays local while embedding-recall silently ships your text to api.openai.com and bills you.** The hole is the priority order, not an absolute requirement. | Disable embedding-recall, or front a local embedding server with a reverse proxy at `https://api.openai.com`-shaped routing, or patch `embedding.rs`. Partial fixes in unmerged PRs **#1248** and **#997** (native Gemini embeddings). |
 | **#1251** | Embedding `base_url` force-appends `/v1`; dimensions from a hardcoded name table | MED | Confirmed at `embedding.rs:197-210`: `needs_v1 = matches!(provider, "openai"\|"groq"\|"together"\|"fireworks"\|"mistral"\|"ollama"\|"vllm"\|"lmstudio")` then `if needs_v1 && !trimmed.ends_with("/v1") { format!("{trimmed}/v1") }` — so `http://host:8004/v3` becomes `/v3/v1`. Separately `infer_dimensions()` (`embedding.rs:106`) is a `match` on model *name* with `_ => 1536`, so an off-table model (Qwen3-Embedding, etc.) silently gets the wrong dimension. | Only reachable via an external rewriting proxy. Issue includes a 6-line patch. |
-| **#1195** | OpenAI-compatible custom `base_url` strips `openai/` from Featherless model IDs | MED — **REAL and reproducible in v0.6.9** | **Confirmed.** An earlier pass of this file wrongly said "unconfirmed" after grepping for a hardcoded literal `"openai/"`. There is none, because `strip_provider_prefix` (`crates/openfang-runtime/src/agent_loop.rs:212-222`) **builds** the prefix: `let slash_prefix = format!("{}/", provider)`. The reporter's config is `provider="openai"`, `model="openai/gpt-oss-120b"`, `base_url=https://api.featherless.ai/v1`, and the error is `The model gpt-oss-120b does not exist` — exactly `strip_provider_prefix("openai/gpt-oss-120b","openai")`. It fires at `agent_loop.rs:528` and `:1765` on **every** request, and the stripped id is *persisted* at `kernel.rs:1686` (registration) / `:3367` (model switch). The only literal model-prefix strips are `drivers/vertex.rs:182` (`models/`), `drivers/qwen_code.rs:140` (`qwen-code/`), `drivers/claude_code.rs:199` (`claude-code/`) — that part of the earlier note was right. Our instance is safe only because its provider is `hyperfusion`, so `"openai/gpt-oss-120b"` does not start with `"hyperfusion/"`. | Never name the provider so that it equals the first path segment of your model ids. Use a custom provider name (as we do) rather than `provider = "openai"`. Unmerged PR **#1248** "preserve custom OpenAI-compatible model IDs" targets this shape. |
+| **#1195** | OpenAI-compatible custom `base_url` strips `openai/` from Featherless model IDs | MED — **REAL and reproducible in v0.6.9** | **Confirmed.** An earlier pass of this file wrongly said "unconfirmed" after grepping for a hardcoded literal `"openai/"`. There is none, because `strip_provider_prefix` (`crates/openfang-runtime/src/agent_loop.rs:211-225`) **builds** the prefix: `let slash_prefix = format!("{}/", provider)`. The reporter's config is `provider="openai"`, `model="openai/gpt-oss-120b"`, `base_url=https://api.featherless.ai/v1`, and the error is `The model gpt-oss-120b does not exist` — exactly `strip_provider_prefix("openai/gpt-oss-120b","openai")`. It fires at `agent_loop.rs:593` and `:1873` on **every** request, and the stripped id is *persisted* at `kernel.rs:1699` (registration) / `:3435` (model switch). The only literal model-prefix strips are `drivers/vertex.rs:182` (`models/`), `drivers/qwen_code.rs:140` (`qwen-code/`), `drivers/claude_code.rs:199` (`claude-code/`) — that part of the earlier note was right. Our instance is safe only because its provider is `hyperfusion`, so `"openai/gpt-oss-120b"` does not start with `"hyperfusion/"`. | Never name the provider so that it equals the first path segment of your model ids. Use a custom provider name (as we do) rather than `provider = "openai"`. Unmerged PR **#1248** "preserve custom OpenAI-compatible model IDs" targets this shape. |
 | **#1154** | "LM STUDIO / OLLAMA is not setup to allow for any use case" (localhost only) | **STALE** | **Fixed in v0.6.9.** `model_catalog.rs:345-352` explicitly cites *"See issue #1154"* and honours `OLLAMA_HOST`/`OLLAMA_BASE_URL`, `LMSTUDIO_HOST`/`LMSTUDIO_BASE_URL`, `VLLM_HOST`/`VLLM_BASE_URL`, `LEMONADE_HOST`/`LEMONADE_BASE_URL`; `drivers/mod.rs:52-82` normalises bare hosts (adds `http://`, appends `/v1`). Issue stayed open because triage stopped. The *embedding* half is genuinely still broken — that's #1212. | Use the env vars, or `[provider_urls]` in `config.toml`. |
 | #1149 | Migrate OpenAI support to Responses API | MED (future) | Chat Completions is legacy; OpenAI recommends Responses for agentic/tool loops, with 40–80% better cache utilisation. Nobody will do this migration now. | None. Expect gradual drift as OpenAI deprecates. |
 | #1033 | Support OpenAI Codex App Server as a model backend | LOW | Use a ChatGPT sub instead of an API key, via the official app-server protocol. | Unmerged PR **#1216** implements a `codex_app_server` driver (1 review, unmerged). |
@@ -337,7 +352,7 @@ is `POST /api/models/custom` → `$OPENFANG_HOME/custom_models.json`; see `provi
 
 | # | Title | Sev | Impact | Workaround |
 |---|---|---|---|---|
-| **#1271** | `web_fetch` injects raw PDF binary into agent context | **HIGH** | Confirmed at `crates/openfang-runtime/src/web_fetch.rs`: L106 size guard, L115-117 reads `content-type`, **L131 uses it only for `is_html()`** — everything else falls through to `resp.text()`. A PDF becomes ~617K chars of FlateDecode garbage in context; blows the window, and with a local model the poisoned history is re-sent every turn, corrupting the whole thread. **Second bug at the same site:** the size guard only fires when the server sends `Content-Length`; chunked responses buffer unbounded into memory before `max_chars` truncation (`web_fetch.rs:144-147`) — a memory-exhaustion vector. The legacy fallback `tool_web_fetch_legacy` (`tool_runner.rs:1545-1577`) has the identical shape (10MB `content_length()` guard, `resp.text()`, 50 000-char truncate). | Never point `web_fetch` at a PDF. The bundled `pdf-reader` skill **cannot** help — it is prompt-only, and the binary is already in context before any skill logic runs. Reporter has a working `pdf-extract` patch against `acf2587` and offered a PR; nobody answered. |
+| **#1271** | `web_fetch` injects raw PDF binary into agent context | **HIGH** | Confirmed at `crates/openfang-runtime/src/web_fetch.rs`: L106 size guard, L115-117 reads `content-type`, **L131 uses it only for `is_html()`** — everything else falls through to `resp.text()`. A PDF becomes ~617K chars of FlateDecode garbage in context; blows the window, and with a local model the poisoned history is re-sent every turn, corrupting the whole thread. **Second bug at the same site:** the size guard only fires when the server sends `Content-Length`; chunked responses buffer unbounded into memory before `max_chars` truncation (`web_fetch.rs:144-147`) — a memory-exhaustion vector. The legacy fallback `tool_web_fetch_legacy` (`tool_runner.rs:1593-1626`) has the identical shape (10MB `content_length()` guard, `resp.text()`, 50 000-char truncate). | Never point `web_fetch` at a PDF. The bundled `pdf-reader` skill **cannot** help — it is prompt-only, and the binary is already in context before any skill logic runs. Reporter has a working `pdf-extract` patch against `acf2587` and offered a PR; nobody answered. |
 | **#1270** | ClawHub installs fail on ambiguous slugs (`ownerHandle` not forwarded) | MED | Confirmed: `crates/openfang-skills/src/clawhub.rs:529` calls `/api/v1/download?slug=<slug>` with no owner. Upstream returns `409 Conflict` → OpenFang surfaces `502` → the dashboard shows a **misleading "daemon unavailable"**. Repro: Skills → ClawHub → install `weather`. | Install the skill manually into `$OPENFANG_HOME/skills/<name>/`. Fix exists as unmerged PR **#1274**. |
 | **#1038** | Global skills in `~/.openfang/skills/` unusable by agents | MED | Global-level skills are *listed* but not *reachable*: `file_read` resolves relative to the workspace, so `~/.openfang/skills/x/SKILL.md` → `…/workspaces/<agent>/skills/x/SKILL.md` (missing). Precisely: `resolve_sandbox_path` (`workspace_sandbox.rs:15-60`) rejects `..` outright but **accepts absolute paths whose canonical form is inside the workspace root** — only paths resolving outside are refused, and `$OPENFANG_HOME/skills` always is. The agent then flails at `shell_exec`, which blocks pipes and redirects (`tool_runner.rs:38-41`, `subprocess_sandbox::contains_shell_metacharacters` — metacharacters are rejected **even in Full exec mode**, `tool_runner.rs:247-255`). | Install skills at the **workspace** level (`$OPENFANG_HOME/workspaces/<agent>/skills/`) rather than globally. |
 | #1001 | ClawHub skills default to `prompt_only`; bundled scripts can't run | MED | Many ClawHub skills ship `curl`/`python` scripts that never execute. Compounded here because **our container has no `curl` and no `git`**. | Convert the skill to an executable type by hand; use `python3` (present) instead of `curl`. |
@@ -346,7 +361,7 @@ is `POST /api/models/custom` → `$OPENFANG_HOME/custom_models.json`; see `provi
 | #1204 | `shell_exec` capped at 120s total / 30s per call | MED | Blocks long-running commands from agents. Note the *model* asserted this cap in its own words in the issue; treat the exact numbers as reported-not-verified. | Background the work (`nohup`/systemd) and poll; or run it outside the agent. Unmerged PR **#1209** adds configurable timeouts + busy-agent queueing. |
 | #1256 | How to upload a file >64KB? | LOW | No documented file-upload API; a 64KB conversation limit is reported. Unanswered. | Write the file to the agent workspace out-of-band and have the agent `file_read` it. |
 | #1070 | Download generated reports as a file from any channel | MED | Reports (5–50KB+) can only be retrieved by SSH-ing to the box. | Read from `$OPENFANG_HOME/workspaces/<agent>/`. Unmerged PR **#1217** adds a workspace listing/download endpoint + `/download` channel command. |
-| #1097 | Workspaces outside `~/.openfang` get polluted with agent dirs | **STALE** | **Fixed in v0.6.9.** `crates/openfang-kernel/src/kernel.rs:293-296` — *"Lives under `~/.openfang/workspaces/{name}/` regardless of where the user pointed the user-facing workspace. **See issue #1097.**"* Private state (`sessions/`, `logs/`, `memory/`, `AGENT.json`) is separated from the user-facing workspace; `kernel.rs:2124-2130` backfills existing agents. Left open only because triage stopped. | — |
+| #1097 | Workspaces outside `~/.openfang` get polluted with agent dirs | **STALE** | **Fixed in v0.6.9.** `crates/openfang-kernel/src/kernel.rs:292-296` — *"Lives under `~/.openfang/workspaces/{name}/` regardless of where the user pointed the user-facing workspace. **See issue #1097.**"* Private state (`sessions/`, `logs/`, `memory/`, `AGENT.json`) is separated from the user-facing workspace; `kernel.rs:2163-2169` backfills existing agents. Left open only because triage stopped. | — |
 
 ### 4.5 Security (all reported, none fixed; no maintainer response to any)
 
@@ -355,13 +370,13 @@ is `POST /api/models/custom` → `$OPENFANG_HOME/custom_models.json`; see `provi
 | **#1234** | WhatsApp gateway HTTP API: **no auth + `Access-Control-Allow-Origin: *`** | **HIGH if WhatsApp enabled** | `/login/start`, `/login/status`, `/message/send`, `/health` require zero authentication and return wildcard CORS. Binding to 127.0.0.1 does **not** save you — any web page you visit can `fetch('http://127.0.0.1:3009/message/send', …)` and send arbitrary WhatsApp messages as your linked account. Classic localhost-CSRF / DNS-rebinding with full impersonation. | **Do not enable the WhatsApp channel.** If you must: firewall port 3009 from the browser (it's loopback, so you can't), or patch in a bearer token. Reporter (`BunnyMoth`) has a hardened fork with a bearer-token implementation. |
 | **#1232** | WhatsApp gateway → Rust API has no auth (loopback trust gap) | **HIGH if enabled** | `packages/whatsapp-gateway/index.js:194-205` POSTs `/api/agents/{id}/message` with no `Authorization`. Any stranger who texts your linked number triggers agent tool execution. | Same: don't enable WhatsApp. |
 | **#1233** | Untrusted WhatsApp content forwarded unfiltered to the LLM | **HIGH if enabled** | `forwardToOpenFang` (`index.js:130-176`) — no length cap, no per-sender rate limit, no content marking. Strangers can burn your LLM spend, prompt-inject your agent into tool actions, or flood it. | Same. |
-| **#1242** | WASM `max_memory_bytes` configured but **never enforced** | MED | Confirmed: `crates/openfang-runtime/src/sandbox.rs:38-39` — *"Maximum WASM linear memory in bytes (**reserved for future enforcement**)"*, `SandboxConfig::default()` is `16 * 1024 * 1024` (`sandbox.rs:54`), but the kernel overwrites it from `ResourceQuota.max_memory_bytes` (default 256 MB, `openfang-types/src/agent.rs:272`) at `kernel.rs:2512` — two different structs, and neither figure is enforced, which is the point of this issue. **No `Store::limiter()` is set anywhere**, so a WASM skill can grow to wasmtime's ~4GB default regardless of the manifest. Fuel metering + epoch interruption cover CPU, not memory. | Only run WASM skills you wrote or audited. Constrain the whole daemon with a systemd `MemoryMax=` / container memory limit. |
+| **#1242** | WASM `max_memory_bytes` configured but **never enforced** | MED | Confirmed: `crates/openfang-runtime/src/sandbox.rs:38-39` — *"Maximum WASM linear memory in bytes (**reserved for future enforcement**)"*, `SandboxConfig::default()` is `16 * 1024 * 1024` (`sandbox.rs:54`), but the kernel overwrites it from `ResourceQuota.max_memory_bytes` (default 256 MB, `openfang-types/src/agent.rs:272`) at `kernel.rs:2538` — two different structs, and neither figure is enforced, which is the point of this issue. **No `Store::limiter()` is set anywhere**, so a WASM skill can grow to wasmtime's ~4GB default regardless of the manifest. Fuel metering + epoch interruption cover CPU, not memory. | Only run WASM skills you wrote or audited. Constrain the whole daemon with a systemd `MemoryMax=` / container memory limit. |
 | **#1241** | WASM watchdog threads accumulate under load | LOW | `sandbox.rs:188-191` spawns one detached OS thread per execution (the issue text cites `sandbox.rs:203-206`, which is v0.6.4 numbering — see `security-model.md` §6.2); the `_watchdog` `JoinHandle` is dropped, so it sleeps the full `timeout_secs` even after the WASM finished. 100 concurrent invocations × 30s timeout = 100 threads × ~2MB stack. Functionally correct, resource-wasteful. | Ignore for single-user load. Fix exists as unmerged PR **#1278**. |
 | #1235 | `rand` unsoundness RUSTSEC-2026-0097 across rand 0.7.3 / 0.8.5 / 0.9.2 | LOW | Only triggers with a custom logger; transitive, cannot be fixed in-tree. `gimli 0.33.1` also flagged yanked. | Accept. Nobody will bump these now. |
-| #1170 | `--require-signed` for `openfang skill install` | MED | `openfang-types::manifest_signing` (Ed25519 via `ed25519-dalek` v2) is library-correct and unit-tested. **One caller does wire it**: `POST /api/skills/install` accepts `require_signed` and `allowed_signer_keys` (`crates/openfang-api/src/types.rs:70-72`) and calls `install_with_options` (`routes.rs:3707-3711`). What is genuinely missing: the CLI `openfang skill install <source>` has no such flag (`main.rs:347-351`), there is no `openfang skill sign`, and the ClawHub route is unwired — `ClawHubInstallRequest` carries only `slug` (`types.rs:115-118`) and `clawhub_install` calls `client.install()` with defaults (`routes.rs:4192`). | Install via `POST /api/skills/install` with `require_signed: true` and pinned `allowed_signer_keys`, never via the CLI or the ClawHub route. |
+| #1170 | `--require-signed` for `openfang skill install` | MED | `openfang-types::manifest_signing` (Ed25519 via `ed25519-dalek` v2) is library-correct and unit-tested. **One caller does wire it**: `POST /api/skills/install` accepts `require_signed` and `allowed_signer_keys` (`crates/openfang-api/src/types.rs:70-72`) and calls `install_with_options` (`routes.rs:3873-3879`). What is genuinely missing: the CLI `openfang skill install <source>` has no such flag (`main.rs:347-351`), there is no `openfang skill sign`, and the ClawHub route is unwired — `ClawHubInstallRequest` carries only `slug` (`types.rs:115-118`) and `clawhub_install` calls `client.install()` with defaults (`routes.rs:4359`). | Install via `POST /api/skills/install` with `require_signed: true` and pinned `allowed_signer_keys`, never via the CLI or the ClawHub route. |
 | #1171 | Propagate `TaintLabel` from ingestion sites to tool sinks | MED | `openfang-types::taint` defines `UserInput`/`ExternalNetwork`/`Pii`/`Secret`/`UntrustedAgent` and passes its unit tests, but `tool_runner.rs` only *adds* labels at fixed sites (L49 `ExternalNetwork`, L76 `Secret`) and never propagates inbound labels. Type system correct, runtime unwired. | Assume no taint tracking exists in practice. |
-| #1172 | Auto-log HAND.toml SHA-256 to the Merkle audit chain on **reload** | **STALE** | **Already shipped in v0.6.9** — an earlier pass of this file wrongly said reload appends nothing. `HandRegistry` has `audit_callback` + `emit_hand_loaded_audit` (`openfang-hands/src/registry.rs:61-101`), fired from **five** sites: `:164` (bundled), `:226` (workspace), `:258` (`install_from_path`), `:306` (`install_from_content`), `:325` (upsert/reload); the kernel wires the callback at `kernel.rs:1225-1257`. Verified live: the chain holds **153** `HAND.toml load hand=… sha256=…` and **4** `HAND.toml reload hand=… sha256=…` entries. | Nothing to do. |
-| #1174 | `POST /api/audit/append` missing | **STALE** | **Already shipped in v0.6.9** — an earlier pass of this file wrongly said it was missing. The route is registered at `server.rs:398-401` with the comment *"issue #1174 — instance-side wrapper integration"*, handler `routes::audit_append` (`routes.rs:3777`). Reads: `GET /api/audit/recent` (`routes.rs:5245`) and `GET /api/audit/verify` (`routes.rs:5281`); `AuditLog::record` is `runtime/src/audit.rs:180`. A POST returns `{"status":"appended","seq":…,"hash":…,"tip":…}` (captured in `security-model.md` §10.3). The issue is open only because triage stopped. | Nothing to do — use the route. |
+| #1172 | Auto-log HAND.toml SHA-256 to the Merkle audit chain on **reload** | **STALE** | **Already shipped in v0.6.9** — an earlier pass of this file wrongly said reload appends nothing. `HandRegistry` has `audit_callback` + `emit_hand_loaded_audit` (`openfang-hands/src/registry.rs:61-101`), fired from **five** sites: `:164` (bundled), `:226` (workspace), `:258` (`install_from_path`), `:306` (`install_from_content`), `:325` (upsert/reload); the kernel wires the callback at `kernel.rs:1255-1288`. Verified live: the chain holds **153** `HAND.toml load hand=… sha256=…` and **4** `HAND.toml reload hand=… sha256=…` entries. | Nothing to do. |
+| #1174 | `POST /api/audit/append` missing | **STALE** | **Already shipped in v0.6.9** — an earlier pass of this file wrongly said it was missing. The route is registered at `server.rs:398-401` with the comment *"issue #1174 — instance-side wrapper integration"*, handler `routes::audit_append` (`routes.rs:3944`). Reads: `GET /api/audit/recent` (`routes.rs:5412`) and `GET /api/audit/verify` (`routes.rs:5448`); `AuditLog::record` is `runtime/src/audit.rs:180`. A POST returns `{"status":"appended","seq":…,"hash":…,"tip":…}` (captured in `security-model.md` §10.3). The issue is open only because triage stopped. | Nothing to do — use the route. |
 | #1181 | Per-agent `file_policy` (deny/prompt/read/write tiers) | MED | Today there are only two coarse gates — workspace-root lock and `validate_path` `..`-rejection. **An agent can read anything the daemon UID can read** — `/etc/hosts`, `~/.ssh/config`. No path-aware approval. Detailed design in the issue; `needs-design`, never answered. | Run the daemon as a dedicated low-privilege UID with a minimal home. |
 | #1180 | Capability gate + MCP bridge for Claude Code subprocesses + approval push | MED | Two real gaps: CC subprocesses can't reach OpenFang's tool surface; and `shell_exec` runs the approval gate *before* the metachar/`exec_policy` checks, so operators approve commands that are then refused anyway. Also: the approval gate has **no push surface** — nothing tells you an approval is pending. | Watch the Approvals panel manually. |
 | #1078 / #754 | Pre-execution / pre-action authorization for Hands (SOF, OAP) | LOW | Third-party-standard proposals; `guardrails` in `HAND.toml` currently only supports human approval gates, not machine-enforceable policy. | — |
@@ -409,7 +424,7 @@ is `POST /api/models/custom` → `$OPENFANG_HOME/custom_models.json`; see `provi
 The whole cluster — **#795, #712, #993, #1211, #1049, #1230** — reduces to two verified facts in
 v0.6.9:
 
-1. **One in-flight turn per agent, globally.** `crates/openfang-kernel/src/kernel.rs:1898-1907`:
+1. **One in-flight turn per agent, globally.** `crates/openfang-kernel/src/kernel.rs:1928-1937`:
 
    ```rust
    // Acquire per-agent lock to serialize concurrent messages for the same agent.
@@ -418,7 +433,7 @@ v0.6.9:
    let _guard = lock.lock().await;
    ```
 
-   (map declared `kernel.rs:180`, initialised `kernel.rs:1221`.) Different agents run in parallel;
+   (map declared `kernel.rs:181`, initialised `kernel.rs:1251`.) Different agents run in parallel;
    different *sessions of the same agent* do **not**. #795 asks for per-`(agent, session)` locking;
    #1230 asks the same question in plainer words. **Answer: no, 100 concurrent requests to one
    cloned agent serialise.**
@@ -491,10 +506,10 @@ Do not chase these; the tracker is just stale. All verified in `/opt/openfang` a
 | # | Status in v0.6.9 | Evidence |
 |---|---|---|
 | **#1154** (Ollama/LM Studio remote hosts) | **Fixed for the chat path** | `model_catalog.rs:345-352` cites the issue by number; `drivers/mod.rs:52-82` normalises `OLLAMA_HOST`/`LMSTUDIO_HOST`/`VLLM_HOST`/`LEMONADE_HOST` (+`_BASE_URL`) into full `/v1` URLs. **Embedding is still broken — that's #1212.** |
-| **#1097** (workspace pollution) | **Fixed** | `kernel.rs:293-296` "…regardless of where the user pointed the user-facing workspace. See issue #1097."; backfill at `kernel.rs:2124-2130`. |
+| **#1097** (workspace pollution) | **Fixed** | `kernel.rs:292-296` "…regardless of where the user pointed the user-facing workspace. See issue #1097."; backfill at `kernel.rs:2163-2169`. |
 | **#1085** ("No active connection") | Not reproducible as filed | Reported on v0.4.4; WS auth/reconnect reworked by #1179/#1189/`ws reconnect` before v0.6.9. |
-| **#1172** (HAND.toml hash on reload) | **Fixed** | `openfang-hands/src/registry.rs:61-101` + five `emit_hand_loaded_audit` call sites (`:164,226,258,306,325`), wired at `kernel.rs:1225-1257`. Live chain contains both `HAND.toml load …` and `HAND.toml reload …` entries. |
-| **#1174** (`POST /api/audit/append`) | **Fixed** | Route at `server.rs:398-401` (comment cites the issue), handler `routes.rs:3777`. |
+| **#1172** (HAND.toml hash on reload) | **Fixed** | `openfang-hands/src/registry.rs:61-101` + five `emit_hand_loaded_audit` call sites (`:164,226,258,306,325`), wired at `kernel.rs:1255-1288`. Live chain contains both `HAND.toml load …` and `HAND.toml reload …` entries. |
+| **#1174** (`POST /api/audit/append`) | **Fixed** | Route at `server.rs:398-401` (comment cites the issue), handler `routes.rs:3944`. |
 
 Conversely, all 42 issues with `closedAt == 2026-05-12` (#868, #869, #871, #890, #915, #931, #1026,
 #1031, #1048, #1051, #1062, #1067, #1083, #1094, #1125, #1134, #1140–#1148, #1152–#1165, #1167,
@@ -526,7 +541,7 @@ loopback bypass closed).
    diagnosis ("the key has no effect") is wrong — the key works, it's just outranked.
 
 4. **Deleting a workflow does not delete its file.** `workflow.rs:235-238` mutates only the
-   in-memory map; `kernel.rs:4634-4650` re-imports every `.json` at boot. `rm
+   in-memory map; `kernel.rs:4468-4484` re-imports every `.json` at boot. `rm
    $OPENFANG_HOME/workflows/<id>.json` yourself, or the "deleted" (possibly scheduled) workflow
    resurrects on restart (#1192).
 
@@ -536,10 +551,10 @@ loopback bypass closed).
 
 6. **Local-LLM privacy has a hole: chat is local, embeddings often are not.** The chat path honours
    `OLLAMA_HOST`/`[provider_urls]`. The embedding path checks `[memory] embedding_provider` first
-   (`kernel.rs:981`), then scans `OPENAI_API_KEY → GROQ_API_KEY → MISTRAL_API_KEY →
+   (`kernel.rs:1012`), then scans `OPENAI_API_KEY → GROQ_API_KEY → MISTRAL_API_KEY →
    TOGETHER_API_KEY → FIREWORKS_API_KEY → COHERE_API_KEY` in that fixed priority order
-   (`kernel.rs:1007-1014`), and only falls back to local `ollama/vllm/lmstudio` when **none** of the
-   six is present (`kernel.rs:1044-1046`). It does not *demand* a cloud key — but if one happens to
+   (`kernel.rs:1040-1047`), and only falls back to local `ollama/vllm/lmstudio` when **none** of the
+   six is present (`kernel.rs:1074-1076`). It does not *demand* a cloud key — but if one happens to
    be exported, memory-recall silently ships text to that cloud on an otherwise "all-local" setup
    (#1212). Set `[memory] embedding_provider` explicitly to close it.
 
@@ -556,7 +571,7 @@ loopback bypass closed).
    bundled `pdf-reader` skill is prompt-only and cannot intercept it (#1271).
 
 9. **`web_fetch`'s size guard is bypassable.** It only fires when the server sends `Content-Length`
-   (`web_fetch.rs:106`, and `tool_runner.rs:1557` for the legacy path). A chunked response buffers
+   (`web_fetch.rs:106`, and `tool_runner.rs:1606` for the legacy path). A chunked response buffers
    unbounded into memory before truncation (#1271).
 
 10. **WASM `max_memory_bytes` is decorative.** `sandbox.rs:38-39` literally says "reserved for future
@@ -564,10 +579,10 @@ loopback bypass closed).
     ~4GB default no matter what the manifest says (#1242).
 
 11. **Skill signing is enforceable from exactly one surface.** `POST /api/skills/install` takes
-    `require_signed` + `allowed_signer_keys` (`types.rs:70-72` → `routes.rs:3707-3711`) and does
+    `require_signed` + `allowed_signer_keys` (`types.rs:70-72` → `routes.rs:3873-3879`) and does
     enforce them. But `openfang skill install` has no `--require-signed` flag (`main.rs:347-351`),
     there is no `openfang skill sign`, and `POST /api/clawhub/install` accepts only `slug`
-    (`types.rs:115-118`) and calls `client.install()` with defaults (`routes.rs:4192`). CLI and
+    (`types.rs:115-118`) and calls `client.install()` with defaults (`routes.rs:4359`). CLI and
     ClawHub installs are therefore always TOFU (#1170).
 
 12. **Global skills (`$OPENFANG_HOME/skills/`) are visible but not usable.** `file_read` resolves
@@ -576,7 +591,7 @@ loopback bypass closed).
     agent's fallback `shell_exec` attempts then die on the metacharacter denylist — pipes and redirects are blocked **even
     in Full exec mode** (`tool_runner.rs:247-255`). Install skills per-workspace (#1038).
 
-13. **One agent = one in-flight turn, forever.** `kernel.rs:1898-1907` takes a per-agent mutex before
+13. **One agent = one in-flight turn, forever.** `kernel.rs:1928-1937` takes a per-agent mutex before
     every message. Cloning the agent is the only parallelism; sessions of the same agent serialise
     (#795, #1230).
 

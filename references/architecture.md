@@ -48,8 +48,12 @@ Not mentioned in `docs/architecture.md` at all but present and wired into the ke
   that merges installed integrations into the MCP server list.
   `crates/openfang-kernel/src/kernel.rs:651-668` (vault unlock), `:918-955` (extensions).
 - A driver-chain / fallback system with **auto-detection of any configured provider**
-  when the primary driver fails to init (`kernel.rs:706-724`), wrapped in
-  `FallbackDriver::with_models` when more than one driver is available (`kernel.rs:757-767`).
+  when the primary driver fails to init (`kernel.rs:~725-745`), wrapped in
+  `FallbackDriver::with_targets` when more than one driver is available (`kernel.rs:826`,
+  `crates/openfang-runtime/src/drivers/fallback.rs`). Renamed from `with_models` and now takes
+  `Vec<FallbackTarget>` instead of `Vec<(driver, model)>` — `FallbackTarget` adds a `provider`
+  field (`fallback.rs:19-29`) carried for accounting only, never sent on the wire, part of the
+  per-call usage grain added this fork (see Memory substrate → SQLite schema v9 below).
 - Additional LLM drivers beyond the "3 native drivers" the docs describe: `bedrock.rs`,
   `claude_code.rs`, `copilot.rs`, `qwen_code.rs`, `vertex.rs` all exist under
   `crates/openfang-runtime/src/drivers/`.
@@ -66,7 +70,7 @@ delegates). Order of operations, condensed from reading the function top to bott
 4. `create_dir_all(data_dir)`.
 5. Open SQLite (`{data_dir}/openfang.db` unless `[memory].sqlite_path` set),
    `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`, run migrations (see Schema
-   section — **8 versions, not 5**).
+   section — **9 versions, not 5**).
 6. Build credential resolver: vault (`<home>/vault.enc`) → dotenv (`<home>/.env`) → env var.
 7. Resolve primary driver via `drivers::create_driver()`. **Primary driver failure is
    non-fatal** — kernel logs a warning and tries `drivers::detect_available_provider()`
@@ -397,12 +401,12 @@ memory-api gateway when `[memory] backend = "http"` and both `http_url` +
 `UsageStore`, `ConsolidationEngine`. All backed by one `Arc<Mutex<Connection>>`
 shared across stores, bridged to async via `tokio::task::spawn_blocking`.
 
-### SQLite schema — 8 versions, not 5
+### SQLite schema — 9 versions, not 5 (v8→v9 shipped this fork, FANG-60)
 
 `docs/architecture.md:55` claims "Five schema versions: V1 core, V2 collab, V3
 embeddings, V4 usage, V5 canonical_sessions." The live `SCHEMA_VERSION` constant
-(`crates/openfang-memory/src/migration.rs:8`) is **8**, gated by `PRAGMA
-user_version` (`get_schema_version`/`set_schema_version`, `migration.rs:51-72`).
+(`crates/openfang-memory/src/migration.rs:8`) is **9**, gated by `PRAGMA
+user_version` (`get_schema_version`/`set_schema_version`, `migration.rs:55,74`).
 Column additions use a hand-rolled `column_exists()` check because SQLite has no
 `ADD COLUMN IF NOT EXISTS`.
 
@@ -416,9 +420,48 @@ Column additions use a hand-rolled `column_exists()` check because SQLite has no
 | 6 | Session labels | `sessions.label TEXT` |
 | 7 | Device pairing | `paired_devices` table |
 | 8 | Audit trail | `audit_entries` table (seq PK, timestamp, agent_id, action, detail, outcome, prev_hash, hash; +idx agent, timestamp, action) |
+| 9 | Per-call usage grain | `usage_events` gains `provider TEXT`, `turn_id TEXT`, `call_index INTEGER`, `requested_model TEXT` (+idx `(model, provider)`, +idx `turn_id`); backfill `turn_id = id` for every pre-existing row; no new table (`migration.rs:344-378`) |
+
+No table shrinks or gets dropped — v9 is purely additive, same as v2/v6/v7/v8 before it.
+`provider`/`call_index`/`requested_model` are left `NULL` on every row a pre-v9 binary ever
+wrote; the migration's own comment explains why it doesn't backfill a guess: *"the manifest
+may have changed since, so any value we invented would be a guess presented as a fact"*
+(`migration.rs:345-346`). `turn_id` is the one column that *is* backfilled, to `id` — a
+legacy row is definitionally its own turn, so that backfill invents nothing
+(`migration.rs:366-368`).
+
+**Is it reversible? No down-migration exists, and you don't need one.** There is no
+`migrate_v9_down` or any rollback function anywhere in `migration.rs` — migrations in this
+codebase are one-directional by design. Rolling the *binary* back to a pre-FANG-60 build
+(`SCHEMA_VERSION = 8`) against a v9 database is still safe, for two reasons that both come
+from the same discipline: every `INSERT`/`SELECT` against `usage_events` lists its columns
+explicitly, never `SELECT *` or a positional `VALUES` list (`usage.rs`, confirmed by grep —
+every call site names its columns). Concretely:
+- The old binary's `run_migrations()` reads `current_version = 9`, which is not `< 8`, so no
+  `migrate_vN` body runs — but it still ends with an **unconditional**
+  `set_schema_version(conn, SCHEMA_VERSION)`, i.e. `8`. Every boot of the old binary quietly
+  resets `PRAGMA user_version` from 9 back to 8. This is cosmetic, not destructive: the four
+  v9 columns and their data stay in the table untouched.
+- The old binary's `INSERT INTO usage_events (id, agent_id, timestamp, model, input_tokens,
+  output_tokens, cost_usd, tool_calls) VALUES (...)` (8 named columns) still works against
+  the 12-column v9 table — SQLite fills the four unnamed columns with `NULL`. Rows written
+  during the rollback window are therefore indistinguishable from genuine pre-v9 legacy rows:
+  `provider`/`call_index`/`requested_model` stay `NULL` forever (nothing backfills them), but
+  `turn_id` **does** get repaired on the next upgrade — booting the new binary again finds
+  `current_version = 8 < 9`, re-runs `migrate_v9`, and its `column_exists()` guards make the
+  four `ALTER TABLE`s no-ops while the `UPDATE usage_events SET turn_id = id WHERE turn_id IS
+  NULL` backfill and the `CREATE INDEX IF NOT EXISTS` calls run again safely. Net effect: a
+  restart-into-old-binary-then-back window costs you per-call granularity (provider/substitute
+  disclosure) for calls made during that window, never data loss or a crash.
+
+What the four new columns are *for* — one `usage_events` row per LLM call instead of per agent
+turn, `/api/usage/by-model`'s new grouping behavior, and what `/message`/SSE/WS/`/v1/chat/completions`
+now disclose about substitutions — is covered in `providers-and-models.md` §9 (Cost tracking), not
+duplicated here.
 
 On the live container (`/var/lib/docker/volumes/openfang_openfang-data/_data/data/openfang.db`,
-confirmed present, WAL mode — `.db-shm`/`.db-wal` siblings exist), the container has
+confirmed present, WAL mode — `.db-shm`/`.db-wal` siblings exist, `PRAGMA user_version` reads
+**9**, still 13 tables — v9 added columns, not a table), the container has
 no `sqlite3` binary to query directly; use `python3`'s `sqlite3` module inside the
 container or copy the file out to the host.
 
@@ -449,7 +492,7 @@ created lazily.
 
 **Backing it up:** the DB is WAL-mode, so `cp` on a live file can capture a torn state. Use SQLite's
 backup API through the container's `sqlite3` *module* (verified — produces a 13-table snapshot with
-`PRAGMA user_version = 8`):
+`PRAGMA user_version = 9`):
 
 ```bash
 D=/var/lib/docker/volumes/openfang_openfang-data/_data     # $D is not set for you here
@@ -551,10 +594,14 @@ comments, unlike the health/detail case which contradicts its own docstring.
 
 ## Hot reload — `build_reload_plan` sees half the config
 
-`crates/openfang-kernel/src/config_reload.rs:123-267`. `KernelConfig` has **47** `pub` fields
-(`openfang-types/src/config.rs`); `build_reload_plan` touches only **25** of them. The other **22 are
-never compared**, so editing them produces neither a `HotAction` nor a `restart_required` entry — the
-hot-reloader cheerfully reports "no changes":
+Also true, and not just about what's *detected*: of what it does detect, over half is only logged,
+not applied, until restart (FANG-61 detail below).
+
+`crates/openfang-kernel/src/config_reload.rs:182+`. `KernelConfig` has **47** `pub` fields
+(`openfang-types/src/config.rs`); `build_reload_plan` touches only **25** of them (counted by
+grepping every `old.<field>`/`new.<field>` comparison in the function — still 25 on this fork, same
+set as before). The other **22 are never compared**, so editing them produces neither a `HotAction`
+nor a `restart_required` entry — the hot-reloader cheerfully reports "no changes":
 
 ```
 users  workspaces_dir  media  links  reload  include  exec_policy  bindings  broadcast
@@ -564,6 +611,71 @@ auth  workflows_dir  heartbeat  skills
 
 Practical consequences: `POST /api/config/reload` after editing `[exec_policy]`, `[docker]`,
 `[budget]`, `[auth]` or `[heartbeat]` does **nothing and says nothing**. Restart the daemon.
+
+### Detected ≠ applied — the second, orthogonal gap
+
+Being in the 25 that `build_reload_plan` *detects* only earns a field a `HotAction`. Detecting a
+diff and actually mutating running kernel state for it are two different steps, and on stock
+OpenFang the API response collapsed them into one list — `hot_actions` — with no way to tell which
+entries the kernel actually touched and which it just logged. This fork splits them
+(`ReloadPlan::applied_actions` / `::deferred_actions`, `config_reload.rs`; populated by
+`OpenFangKernel::apply_hot_actions()`, `kernel.rs:4227`, called from `reload_config()`,
+`kernel.rs:4179`). The module doc-comment at the top of `config_reload.rs` states the current split
+plainly and is worth quoting verbatim because it is the one place actually-applied and
+detected-only are enumerated together:
+
+> **Actually applied in-process** (kernel state genuinely mutated, no restart needed): approval
+> policy, cron max jobs, default model, fallback provider chain.
+>
+> **Detected as hot-reloadable, but NOT yet applied in-process** (kernel only logs the change; the
+> running daemon keeps behaving on the old config until restarted): channels, provider URL
+> overrides, skills, usage footer, web config, browser, webhook triggers, extensions, MCP servers,
+> A2A config.
+
+A changed field ends up in one of two places, and only one of them can act without a restart.
+`build_reload_plan` (`config_reload.rs`) pushes **4** kinds of change into `restart_reasons` —
+those never produce a `HotAction` at all — and **13** into `hot_actions`. Of those 13,
+`apply_hot_actions` (`kernel.rs:4227-4330`) has named branches for five and a catch-all for the
+rest, and the split is **4 applied / 9 deferred**: `UpdateApprovalPolicy`, `UpdateCronConfig`,
+`UpdateDefaultModel` and `ReloadFallbackProviders` mutate kernel state; `ReloadProviderUrls` is
+explicitly deferred despite writing the catalog (see below); the remaining eight — channels,
+skills, web, browser, webhook, extensions, MCP servers, A2A — fall through the catch-all with
+"noted but not yet auto-applied".
+had exactly one catch-all branch for everything not individually handled ("noted but not yet
+auto-applied") and the API returned only `plan.hot_actions` — an operator polling
+`POST /api/config/reload` had no field to distinguish "the daemon just did this" from "the daemon
+logged this and changed nothing." `POST /api/config/reload`'s response now reports `status`
+(`"applied"` / `"partial"` / `"no_changes"` / `"error"`), `hot_actions_applied`,
+`hot_actions_deferred`, and a `deferred_note` string when the deferred list is non-empty
+(`routes.rs:11168-11214`). **Read `hot_actions_applied`/`hot_actions_deferred`, never a bare
+`hot_actions` field** — treating "detected" as "applied" is exactly the FANG-42 defect this split
+exists to close.
+
+**`ReloadProviderUrls` specifically — verify this yourself before trusting a summary of it, including
+this one; an earlier audit pass on this fork got it backwards.** It is in the **deferred** list, not
+applied, despite doing real work. Read `kernel.rs:4253` (`HotAction::ReloadProviderUrls` arm inside
+`apply_hot_actions`) — the in-code comment explains the mechanism precisely:
+
+> Deferred, not applied — even though the catalog write below does happen. `lookup_provider_url()`
+> consults `self.config.provider_urls` first and the catalog only as a fallback, and `self.config`
+> is frozen at boot (`reload_config` takes `&self` and never rewrites it). So for any provider
+> already present in the boot-time `[provider_urls]` this updates `/api/providers` and leaves the
+> driver's `base_url` untouched: the next LLM call still goes to the old address. The catalog write
+> is kept because it does take effect for a provider that was NOT in the boot config.
+
+Concretely: `catalog.apply_url_overrides(&new_config.provider_urls)` (`kernel.rs:4275`) does run and
+does update the in-memory model catalog (which is what `/api/providers` reads), but the actual driver
+construction path (`resolve_driver` → `lookup_provider_url`, `kernel.rs:5668-5682`) checks
+`self.config.provider_urls` **first** and the catalog **second** — and `self.config` is the
+boot-time snapshot, never mutated by a reload. So editing an *existing* `[provider_urls]` entry and
+reloading changes what the dashboard shows but not where the next request actually goes; adding a
+*brand-new* provider to `[provider_urls]` that wasn't there at boot does take effect immediately,
+because `lookup_provider_url`'s first check simply misses and falls through to the (now-updated)
+catalog. `apply_hot_actions` reports this action as `deferred`, not `applied`, precisely because it
+cannot tell which of those two cases a given reload is without inspecting every key — so it reports
+the pessimistic, honest answer for the whole action rather than a per-key one. **Do not write "in the
+fork, `ReloadProviderUrls` is applied" into anything — it is deferred, on purpose, and the reason is
+this asymmetry, not an oversight left to fix.**
 
 ## `KernelHandle::memory_store` writes to ONE global namespace
 
@@ -606,8 +718,12 @@ for the task board.
   default, not the docs' claimed 80%/20 — and there's a third, undocumented
   quota-headroom trigger (80% of remaining hourly token quota) that can fire
   compaction independent of message count or context-window percentage.
-- SQLite schema is at version **8** (adds `sessions.label`, `paired_devices`,
-  `audit_entries`), not the 5 versions docs describe.
+- SQLite schema is at version **9** (adds `sessions.label`, `paired_devices`,
+  `audit_entries`, and — v9, this fork — four columns on `usage_events`: `provider`,
+  `turn_id`, `call_index`, `requested_model`), not the 5 versions docs describe. v9 is
+  purely additive with no down-migration; rolling the binary back to pre-v9 is safe but
+  resets `PRAGMA user_version` to 8 on every old-binary boot and leaves the four new
+  columns `NULL` on rows written during that window (`migration.rs:8,344-378`).
 - Canonical cross-channel context is injected as a **user message**, not appended
   into the system prompt — deliberately, to keep the system prompt stable for
   provider-side prompt caching (`agent_loop.rs` around the `canonical_context_msg`
@@ -620,8 +736,15 @@ for the task board.
   `model.max_tokens`, `model.temperature`, `model.base_url`, `model.api_key_env`, `fallback_models`,
   `capabilities.shell` / `.network` / `.memory_read` / `.memory_write` / `.agent_message`, `tags`,
   `profile`, `module`, `state_dir`, `hooks`, `metadata`, `max_history_messages`.
-- The hot-reloader is blind to 22 of `KernelConfig`'s 47 fields (25 are compared) — see the
-  `build_reload_plan` section above.
+- The hot-reloader is blind to most of `KernelConfig`'s 47 fields — see the `build_reload_plan`
+    section above. Of the 13 `HotAction`s it can raise, exactly **4** (`UpdateApprovalPolicy`,
+    `UpdateCronConfig`, `UpdateDefaultModel`, `ReloadFallbackProviders`) are mutated in-process;
+    the other **9** are detected and logged but deferred until restart. A further 4 kinds of change
+    skip `HotAction` entirely and set `restart_required` outright.
+  `hot_actions_deferred`, not a bare `hot_actions` field. `ReloadProviderUrls` is deferred even
+  though it does write the model catalog — the driver's `base_url` resolution still checks the
+  frozen boot config first (`kernel.rs:4253`) — do not trust a claim that it is now "applied"
+  without re-reading that comment yourself.
 - Agent private state (`SOUL.md`, per-agent memory) always lives under
   `<home>/workspaces/<name>/` by *name*, regardless of what `workspace =` is set to
   in `agent.toml` — the user-facing workspace path is a separate, optional overlay

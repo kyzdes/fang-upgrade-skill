@@ -1259,10 +1259,12 @@ So the config key works; the manifest silently overrides it.
 
 **Two extra traps.**
 - The monitor builds `HeartbeatConfig` once and moves it into the spawned task
-  (`kernel.rs:4838-4846`), and `[heartbeat]` appears **nowhere** in `build_reload_plan`
-  (`crates/openfang-kernel/src/config_reload.rs:123-267`) — no `HotAction`, not even a
-  `restart_required` entry. Editing `[heartbeat]` does nothing until a full process restart, and the
-  hot-reloader will not tell you.
+  (`kernel.rs:4838-4846`), and `[heartbeat]` still appears **nowhere** in `build_reload_plan`
+  (`crates/openfang-kernel/src/config_reload.rs:182-328`) — no `HotAction`, not even a
+  `restart_required` entry, even after the applied/deferred split the reload plan now carries for
+  everything else (`ReloadPlan.applied_actions` / `.deferred_actions`, same file). Editing
+  `[heartbeat]` does nothing until a full process restart, and the hot-reloader will not tell you —
+  it has no entry to be honest or dishonest about.
 - `docs/configuration.md:1602` describes `heartbeat_interval_secs` as "Seconds between heartbeat
   health checks". It is not — the check interval is the hardcoded 30 s
   `DEFAULT_CHECK_INTERVAL_SECS`; `heartbeat_interval_secs` is half the unresponsive threshold.

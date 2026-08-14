@@ -22,11 +22,13 @@ disagree with code/live behavior, that is called out explicitly — **trust the 
 
 `docs/channel-adapters.md` claims 40 channel adapters. The real numbers, counted 2026-08-10:
 
-- **43 adapter modules** under `crates/openfang-channels/src/` (48 `.rs` files minus the five
-  non-adapters `bridge.rs`, `formatter.rs`, `lib.rs`, `router.rs`, `types.rs`).
+- **43 adapter modules** under `crates/openfang-channels/src/` (49 `.rs` files minus the six
+  non-adapters `bridge.rs`, `formatter.rs`, `lib.rs`, `router.rs`, `types.rs`, `redact.rs` — the
+  last one is new in this fork, the shared credential-redaction helper behind FANG-39/43/44, see
+  §1.8a). Adapter count is unchanged from stock — the fork added a helper module, not a channel.
 - **42 entries returned by `GET /api/channels`** — the hardcoded `CHANNEL_REGISTRY` table at
-  `crates/openfang-api/src/routes.rs:1691`, iterated by `list_channels` (`routes.rs:2650-2657`).
-  Verified live.
+  `crates/openfang-api/src/routes.rs:1742`, iterated by `list_channels` (`routes.rs:2701-2755`).
+  Verified live (`tools/list`-style count, re-checked 2026-08-14: still 42, `mqtt` still absent).
 - The one module with no catalog entry is **`mqtt.rs`**: it has a `ChannelType::Mqtt` variant and is
   wired in `channel_bridge.rs:52,816,1733`, but the dashboard catalog never lists it, so it is
   invisible to `/api/channels` and to the channel-config UI. Configure it by hand in `config.toml`.
@@ -163,7 +165,75 @@ match_rule = { channel = "discord", channel_id = "1234567890" }
   `match_rules` or `channnel_id` fails config load loudly instead of silently matching nothing.
   The top-level `KernelConfig` stays permissive on unknown keys (forward-compat).
 
-### 1.8 Known security issues (verified open on GitHub, `RightNow-AI/openfang`)
+### 1.8 Known security issues
+
+#### 1.8a Credential leaks — closed in this fork (FANG-39/43/44), not present in stock v0.6.9
+
+Three distinct credential leaks existed on this instance under stock v0.6.9 and are fixed on
+`ours`. If this instance ever ran the stock build before these commits landed, treat every
+credential below as burned and rotate it — the fix stops future leaks, it does nothing about a
+token that already went out in a log line or a session file.
+
+1. **Telegram bot token in the LLM-visible prompt and in the session history on disk.**
+   `telegram_get_file_url()` (`crates/openfang-channels/src/telegram.rs:904-923`) builds a
+   download URL of the shape `{api_base_url}/file/bot{token}/{file_path}` — the live bot token is
+   embedded in the URL, not passed as a header. For documents and voice messages, `bridge.rs`
+   formats that URL straight into agent-visible text: `[User sent a file ({filename}): {url}]`
+   (`crates/openfang-channels/src/bridge.rs:923`, `:1048`, `:1075`) — no download step in between,
+   unlike photos. That text becomes part of the LLM prompt and gets persisted verbatim in the
+   session on disk. Fixed by `redact_file_token()` (`telegram.rs:58`), applied at the two
+   `ChannelContent::File`/`ChannelContent::Voice` construction sites (`telegram.rs:1057`, `:1070`)
+   before the URL ever reaches `ChannelContent` — the token is stripped, not merely masked in
+   display.
+2. **The same token via `reqwest::Error`.** `reqwest` attaches the full request URL to
+   connection-level errors (failed connect, timeout, TLS, redirect). A bare `{e}` on such an error
+   — in a log line, or (in the Multipart image-download path) in agent-visible text — printed the
+   token in cleartext. Fixed by `redact_reqwest_error()` (`crates/openfang-channels/src/redact.rs`,
+   `e.without_url()`), called on every `.send()` in `telegram.rs` and on the image-download error
+   path in `bridge.rs:1628-1642`.
+3. **Raw provider error body in `fallback.reason`.** A 401 from an LLM provider typically quotes
+   the rejected key back in its error body; before the fix that raw body reached
+   `fallback.reason`/`calls[].reason` in the `/message`, SSE, WS and `/v1/chat/completions`
+   responses (see §4.6) verbatim. Fixed in
+   `crates/openfang-runtime/src/drivers/fallback.rs:182-188,233-239`: every substitution's error is
+   routed through `llm_errors::classify_error(...).sanitized_message`
+   (`crates/openfang-runtime/src/llm_errors.rs:243,406`), which redacts `sk-`/`key-`/`Bearer `/
+   `bearer ` prefixed fragments (`redact_secrets`, `llm_errors.rs:495`), strips HTML error pages,
+   and caps length — before the string is ever assigned to `first_error`.
+
+None of these three appear in `docs/security.md`, `docs/channel-adapters.md`, or the WhatsApp/
+Matrix issues below — they were closed with no upstream GitHub issue number, so the only place
+this is recorded is here and in the fork's own commit history.
+
+#### 1.8b Six channel adapters leaked credentials via `reqwest::Error` — closed (FANG-39/44)
+
+Same root cause as leak #2 above, six more adapters: `dingtalk`, `messenger`, `flock`, `threema`,
+`wecom`, `gotify`. All embed their credential in the request URL's query string (`?access_token=`,
+`?token=`), so an unredacted `reqwest::Error` on a failed request prints it. All six are closed —
+every `.send()` in each adapter now runs through
+`redact_reqwest_error()`/`crate::redact::redact_reqwest_error` (defined once in
+`crates/openfang-channels/src/redact.rs`, imported per-adapter).
+
+The blast radius was not identical across all six, though, and it is worth knowing which:
+
+- **`dingtalk`, `messenger`, `wecom`, `gotify`** — the credential is in the URL for *every* call,
+  including the one that actually sends a message (`send()`/`api_send_message()`:
+  `dingtalk.rs:271,299-301`; `messenger.rs:98-130,379-420`; `wecom.rs:303-329`;
+  `gotify.rs:111-145`). So the send path itself needed redaction, and got it.
+- **`flock`, `threema`** — only `validate()` puts the credential in the URL query string
+  (`flock.rs:64-78`, `threema.rs:67-80`, both explicitly commented `FANG-44`); the actual
+  send/`api_send_message()` call carries the credential in the JSON body or form-encoded POST
+  data instead (`flock.rs:99-113`, `threema.rs:96-111`, both commented "no redaction needed on the
+  `.send()` below" — verified true: `reqwest` never attaches a request *body* to an error, only the
+  URL). So for these two, only the one-time credential-check call was ever at risk, not every
+  message sent. `validate()` is still redacted (`flock.rs:78`, `threema.rs:80`) — belt and braces —
+  but the send path never needed it.
+
+Practical read: if this instance ran stock v0.6.9 with any of these six channels configured, rotate
+that channel's credential regardless of which sub-case it falls into — `validate()` runs at every
+adapter startup, so the exposure window existed even for `flock`/`threema`.
+
+#### 1.8c Open upstream issues (verified open on GitHub, `RightNow-AI/openfang`)
 
 **WhatsApp gateway (`packages/whatsapp-gateway/index.js`, a separate Node.js sidecar process,
 NOT the in-process `whatsapp.rs` Cloud-API adapter)** — three open issues, all still reproducible
@@ -248,7 +318,7 @@ Two independent surfaces, with **different tool sets**:
    (drop into `.cursor/mcp.json`, VS Code MCP settings, or `claude_desktop_config.json`)
 
 2. **`POST /mcp`** (HTTP, JSON-RPC) — exposes the kernel's **full** tool set: all **65** built-in
-   tools (`mcp_http` calls `builtin_tool_definitions()` verbatim, `routes.rs:7022`) + installed skill
+   tools (`mcp_http` calls `builtin_tool_definitions()` verbatim, `routes.rs:7221`) + installed skill
    tools + all connected `[[mcp_servers]]` tools, executed through
    `kernel.execute_tool()`. Verified live: `tools/list` returns **65** on this instance (no skills,
    no MCP servers). **This endpoint requires the global `api_key`** if one is configured
@@ -391,7 +461,7 @@ and rely on "GET is read-only and safe," note that GET `/api/config` (full confi
 which provider/model is active and env var *names* — though not the secret values themselves) and
 GET `/api/channels` are both public. Nothing in the public list leaks a raw secret value (secrets
 are stored as env var **names**, not literal values, in config responses — see
-`routes.rs:5522`: `"api_key": if config.api_key.is_empty() { "not set" } else { "***" }`).
+`routes.rs:5689`: `"api_key": if config.api_key.is_empty() { "not set" } else { "***" }`).
 `GET /api/metrics` and `GET /api/mcp/servers` are *not* public, which is inconsistent with
 `/api/status`/`/api/providers`/`/api/agents` also being read-only listing endpoints that *are*
 public — there's no principled "read-only ⇒ public" rule, it's an explicit allowlist that must be
@@ -431,13 +501,13 @@ proves the endpoint exists — check `server.rs` for the real route table.
 ### 4.4 `/hooks/wake` and `/hooks/agent` — a double-auth trap
 
 These two webhook-trigger endpoints (`routes::webhook_wake`, `routes::webhook_agent`,
-`routes.rs:11515-11608`) are gated **twice**, and both checks read the **same** `Authorization`
+`routes.rs:11733-11786` and `:11792-11876`) are gated **twice**, and both checks read the **same** `Authorization`
 header:
 
 1. The global `middleware::auth` layer — `/hooks/*` is **not** in the public-path allowlist, so
    this requires `Authorization: Bearer <api_key>` (the global key) or the request 401s before
    the handler even runs.
-2. Inside the handler, `validate_webhook_token()` (`routes.rs:11939-11958`) re-reads the *same*
+2. Inside the handler, `validate_webhook_token()` (`routes.rs:12157-12176`) re-reads the *same*
    `Authorization: Bearer <token>` header and compares it against a **different** secret — the
    env var named by `webhook_triggers.token_env` (default `OPENFANG_WEBHOOK_TOKEN`, config struct
    `WebhookTriggerConfig` in `openfang-types::config`, disabled/`None` by default — confirmed
@@ -446,7 +516,7 @@ header:
 **Correction to an earlier version of this section:** the two checks are *not* mutually exclusive,
 because the middleware accepts the API key from a **query parameter** as well as from the header.
 `middleware.rs:196-210` honours `?token=<api_key>`, which satisfies check 1 and leaves the
-`Authorization: Bearer` header free for `validate_webhook_token` (`routes.rs:11939-11957`). Verified
+`Authorization: Bearer` header free for `validate_webhook_token` (`routes.rs:12157-12176`). Verified
 live:
 
 | Attempt | Result |
@@ -480,6 +550,72 @@ routes.
 | Dashboard auth | `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/check` | All three explicitly public (so you can attempt login without already having a session) |
 | Metrics / Peers / Comms | `/api/metrics`, `/api/peers`, `/api/comms/*` | Auth required |
 | Webhooks | `/hooks/wake`, `/hooks/agent` | Auth required (global key) **and** a second, separate `OPENFANG_WEBHOOK_TOKEN` check — see §4.4 |
+
+### 4.6 Model/provider/fallback disclosure — every response surface (FANG-57)
+
+Accounting is per **LLM call**, not per turn — a turn is `Vec<LlmCall>`, and every surface below
+is a projection of that same array, so they cannot disagree with each other
+(`crates/openfang-types/src/usage.rs`, `LlmCall`/`FallbackSummary`). Four surfaces disclose it, one
+only partially:
+
+**`POST /api/agents/{id}/message`** (non-streaming) — the JSON response gains four fields beyond
+the pre-fork `response`/`input_tokens`/`output_tokens`/`iterations`/`cost_usd`
+(`crates/openfang-api/src/types.rs:58-78`, wired at `routes.rs:417-432`):
+```json
+{
+  "response": "...", "input_tokens": 7140, "output_tokens": 2, "iterations": 1,
+  "model_used": "google/gemma-4-31b-it",
+  "provider_used": "hyperfusion",
+  "fallback": null,
+  "calls": [
+    {"n": 0, "provider": "hyperfusion", "model": "google/gemma-4-31b-it",
+     "input_tokens": 7140, "output_tokens": 2, "tool_calls": 0, "cost_usd": 0.0}
+  ]
+}
+```
+`model_used`/`provider_used` name whoever served the **last** call of the turn
+(`openfang_types::usage::last_served`). `fallback` is `null`/omitted
+(`#[serde(skip_serializing_if = "Option::is_none")]`) unless some call in the turn was served by a
+substitute, in which case it's a `FallbackSummary` — see `providers-and-models.md` for its six
+fields (`used`, `calls`, `of`, `requested`, `served_by`, `reason`); `reason` is the sanitized
+string from §1.8a point 3, never the raw provider error. `calls` is one entry per LLM call, in
+turn order, and is omitted entirely (not `[]`) when empty. Verified live 2026-08-14 against
+`agent bf7564a1-…`: response matched this shape exactly.
+
+**`POST /api/agents/{id}/message/stream`** (SSE) — a new event type, `call`, fires once per LLM
+call as it completes (`routes.rs:1646-1666`), alongside the pre-existing `chunk`/`tool_use`/
+`tool_result`/`done` events (`done`'s shape is untouched, so old clients that only parse `done`
+still work):
+```
+event: call
+data: {"n":0,"provider":"hyperfusion","model":"google/gemma-4-31b-it",
+       "requested":null,"reason":null,
+       "usage":{"input_tokens":7140,"output_tokens":2}}
+```
+`requested`/`reason` are non-null only when this call substituted for a different requested model.
+
+**`GET /api/agents/{id}/ws`** (WebSocket) — the `{"type":"response", ...}` message gains the same
+four fields as the non-streaming HTTP response — `model_used`, `provider_used`, `fallback`,
+`calls`  — computed from the accumulated `stream_calls` of the turn, with `cost_usd` filled in
+per-call from the model catalog just before sending (`crates/openfang-api/src/ws.rs:959-1000`).
+
+**`POST /v1/chat/completions` — non-streaming only.** The OpenAI-compatible `model` field in the
+response stays the *agent name* the client asked for (so clients that compare `response.model`
+against their request don't break); the model that actually served the turn goes into a vendor
+extension object inserted at the top level, `"openfang"`
+(`crates/openfang-api/src/openai_compat.rs:356-373`):
+```json
+{ "id": "...", "object": "chat.completion", "model": "assistant", "choices": [...],
+  "usage": {...},
+  "openfang": {"model_used": "...", "provider_used": "...", "fallback": null, "calls": [...]} }
+```
+**The streaming variant (`"stream": true`) does not carry this.** `stream_response()`
+(`openai_compat.rs:394-550`) forwards `TextDelta`/`ToolUseStart`/`ToolInputDelta` into OpenAI-shape
+chunks but has no arm for `StreamEvent::CallReported` — it falls into the catch-all `_ => continue`
+(`openai_compat.rs:529`) and is dropped. A client polling model/provider/fallback off a streaming
+`/v1/chat/completions` response gets nothing; it has to use the SSE `call` event on
+`/message/stream` instead, or fall back to non-streaming `/v1/chat/completions` for the vendor
+field.
 
 ---
 
@@ -520,7 +656,7 @@ routes.
    **Correct env-var names** (an earlier version of this file invented `WA_ACCESS_TOKEN` /
    `WA_PHONE_ID` / `WA_VERIFY_TOKEN`, which appear **nowhere** in the repo): the in-process Cloud API
    adapter uses **`WHATSAPP_ACCESS_TOKEN`** and **`WHATSAPP_VERIFY_TOKEN`**
-   (`config.rs:2062-2087`, `routes.rs:1747-1754`) plus a `phone_number_id` **config field**;
+   (`config.rs:2062-2087`, `routes.rs:1798-1805`) plus a `phone_number_id` **config field**;
    Web/QR (gateway) mode is selected by **`WHATSAPP_WEB_GATEWAY_URL`** (`whatsapp.rs:23`). Those
    Cloud-API credentials have nothing to do with the gateway's security posture — the gateway runs a
    Baileys-style QR-login session of its own.
@@ -551,12 +687,12 @@ routes.
     `api_key` + non-loopback bind + no `OPENFANG_ALLOW_NO_AUTH` would fail closed (401 everywhere
     non-loopback) rather than fail open, per the #1034 fix — annoying but not a leak.
 14. **The channel count depends on which list you ask.** 43 adapter modules in
-    `openfang-channels/src/`, 42 in `GET /api/channels` (`CHANNEL_REGISTRY`, `routes.rs:1691`), 12
+    `openfang-channels/src/`, 42 in `GET /api/channels` (`CHANNEL_REGISTRY`, `routes.rs:1742`), 12
     named `ChannelType` variants. `mqtt` is the odd one out: a working adapter with a `ChannelType`
     variant that the dashboard catalog omits, so it never appears in `/api/channels` or the config
     UI. `docs/channel-adapters.md`'s "40" matches none of these.
 15. **`POST /mcp` exposes all 65 builtin tools and runs them with no agent context.** `mcp_http`
-    (`routes.rs:7017-7112`) calls `execute_tool` with `allowed_tools = None`, `workspace_root = None`
+    (`routes.rs:7216-7311`) calls `execute_tool` with `allowed_tools = None`, `workspace_root = None`
     and `exec_policy = None`. Verified live with a valid key: `tools/list` → 65;
     `tools/call file_read {"path":"/data/secrets.env"}` → returns `HYPERFUSION_API_KEY`;
     `tools/call file_read {"path":"/etc/hostname"}` → returns the file. `shell_exec` *is* still
@@ -572,7 +708,7 @@ routes.
 | Concern | File(s) |
 |---|---|
 | Channel adapter trait + all 43 adapter modules | `crates/openfang-channels/src/*.rs` |
-| Dashboard channel catalog (the 42 in `GET /api/channels`) | `CHANNEL_REGISTRY`, `crates/openfang-api/src/routes.rs:1691` |
+| Dashboard channel catalog (the 42 in `GET /api/channels`) | `CHANNEL_REGISTRY`, `crates/openfang-api/src/routes.rs:1742` |
 | Channel↔agent wiring, adapter init | `crates/openfang-api/src/channel_bridge.rs` |
 | Output formatting | `crates/openfang-channels/src/formatter.rs` |
 | Per-user rate limiting | `crates/openfang-channels/src/rate_limiter.rs` |

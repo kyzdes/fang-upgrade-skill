@@ -226,8 +226,12 @@ def cmd_fetch(a):
         os.remove(src)
 
     # Split into parts small enough to survive OpenFang's per-tool-result cap
-    # (30% of the context window x 2 chars/token). file_read returns the WHOLE
-    # file, so a 220k-char transcript would be silently truncated mid-way.
+    # (30% of the context window x 2 chars/token). file_read now takes offset/limit,
+    # but a plain call with neither still returns the WHOLE file with no automatic
+    # truncation of its own -- and the outer per-tool-result cap that DOES truncate
+    # applies silently regardless, so a 220k-char transcript read in one call would
+    # still be cut mid-way with no notice. Pre-splitting stays the deterministic fix;
+    # it doesn't depend on the agent remembering to page with offset/limit itself.
     parts = []
     if a.chunk_chars > 0 and len(text) > a.chunk_chars:
         buf, size, idx = [], 0, 1

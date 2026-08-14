@@ -34,6 +34,13 @@ ofctl -x version GET /api/health
 ofdoctor
 ```
 
+## Testing a patch against the fork
+
+The fork ships its own harness for exercising LLM-provider and Telegram edge cases against
+a real daemon — a scripted fake OpenAI-compatible provider plus a fake Telegram Bot API,
+run as containers in the staging box's netns. It lives in the fork's repo, not in this
+skill: `tests/fang/harness/` (`fangrig --help`, `tests/fang/harness/README.md`).
+
 ## Reading it
 
 Addresses and host names appear as `<tailnet-ip>`, `<public-ip>`, `<tailnet-host>` — substitute

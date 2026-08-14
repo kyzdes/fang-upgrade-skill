@@ -7,7 +7,7 @@ rather than writing one from a blank file.
 
 Install (the only method that survives a restart — see `references/hands.md`):
 
-    ofhand install /root/.claude/skills/openfang/assets/youtube-insights-hand
+    ofhand install /root/.claude/skills/fang-upgrade/assets/youtube-insights-hand
 
 `ofhand install` lints the manifest, copies the two files into
 `$OPENFANG_HOME/hands/youtube-insights/`, restarts the container, and then proves
@@ -17,8 +17,8 @@ hand=youtube-insights` and confirming `GET /api/hands/youtube-insights`.
 By hand, copy through the host volume:
 
     mkdir -p /var/lib/docker/volumes/openfang_openfang-data/_data/hands/youtube-insights
-    cp /root/.claude/skills/openfang/assets/youtube-insights-hand/HAND.toml \
-       /root/.claude/skills/openfang/assets/youtube-insights-hand/SKILL.md \
+    cp /root/.claude/skills/fang-upgrade/assets/youtube-insights-hand/HAND.toml \
+       /root/.claude/skills/fang-upgrade/assets/youtube-insights-hand/SKILL.md \
        /var/lib/docker/volumes/openfang_openfang-data/_data/hands/youtube-insights/
     docker restart openfang-openfang-1
 
@@ -30,7 +30,7 @@ reads `/data/hands/<id>/HAND.toml`, so it reloads the **old** definition after t
 restart and logs `Loaded workspace hand hand=youtube-insights` anyway — the update
 silently does nothing. If you want `docker cp`, the trailing `/.` is required:
 
-    docker cp /root/.claude/skills/openfang/assets/youtube-insights-hand/. \
+    docker cp /root/.claude/skills/fang-upgrade/assets/youtube-insights-hand/. \
         openfang-openfang-1:/data/hands/youtube-insights/
 
 ## Note on the deployed copy
