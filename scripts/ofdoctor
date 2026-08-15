@@ -30,8 +30,8 @@ HOME_HOST = os.environ.get(
 BASE_URL = os.environ.get("OPENFANG_URL", "http://127.0.0.1:4200").rstrip("/")
 CONTAINER = os.environ.get("OPENFANG_CONTAINER", "openfang-openfang-1")
 
-# Public paths worth probing for secret leakage. /api/cron/* is the documented
-# offender: it returns delivery_targets verbatim, headers included.
+# Paths worth probing without credentials. In passkey mode all but health should
+# return 401; the scan still inspects any accidental 200 body for known secrets.
 LEAK_PROBES = [
     "/api/cron/jobs",
     "/api/config",
@@ -206,7 +206,7 @@ def check_daemon(key):
         return False
     record("OK", "daemon reachable", f"{BASE_URL} v{body.get('version')}")
 
-    code, detail = get_json("/api/health/detail")
+    code, detail = get_json("/api/health/detail", key)
     if code == 200 and detail:
         up = int(detail.get("uptime_seconds", 0))
         record(
@@ -262,7 +262,7 @@ def check_provider_and_model(cfg, key):
     else:
         record("OK", "#1195 prefix collision", f"provider {prov!r} is not a prefix of {model!r}")
 
-    code, provs = get_json("/api/providers")
+    code, provs = get_json("/api/providers", key)
     ids = [p.get("id") for p in (provs or {}).get("providers", [])] if code == 200 else []
     if prov in ids:
         record("OK", "provider registered", f"{prov} visible in /api/providers ({len(ids)} total)")
@@ -277,7 +277,7 @@ def check_provider_and_model(cfg, key):
             f"(or add a [provider_urls] entry to config.toml and restart)",
         )
 
-    code, models = get_json("/api/models")
+    code, models = get_json("/api/models", key)
     entries = (models or {}).get("models", []) if code == 200 else []
     hit = next((m for m in entries if m.get("id") == model), None)
     if not hit:
@@ -374,8 +374,8 @@ def check_leaks(key, cfg_path):
         )
 
 
-def check_cron():
-    code, data = get_json("/api/cron/jobs")
+def check_cron(key):
+    code, data = get_json("/api/cron/jobs", key)
     if code != 200 or data is None:
         record("WARN", "cron jobs unreadable", f"GET /api/cron/jobs -> {code}")
         return
@@ -401,13 +401,13 @@ def check_cron():
             record(
                 "FAIL",
                 f"cron {name} carries a credential-shaped field",
-                "delivery_targets are returned verbatim by the public GET /api/cron/jobs",
+                "delivery_targets are returned verbatim by authenticated GET /api/cron/jobs",
                 "move the secret out of the job; a host crontab entry can hold it instead",
             )
 
 
-def check_hands():
-    code, data = get_json("/api/hands")
+def check_hands(key):
+    code, data = get_json("/api/hands", key)
     registry = {h.get("id") for h in (data or {}).get("hands", [])} if code == 200 else set()
     hands_dir = os.path.join(HOME_HOST, "hands")
     on_disk = set()
@@ -434,7 +434,7 @@ def check_hands():
     except Exception:
         state = []
     if state:
-        code, agents = get_json("/api/agents")
+        code, agents = get_json("/api/agents", key)
         live = {a.get("id") for a in (agents or [])} if code == 200 else set()
         for inst in state:
             hid, aid = inst.get("hand_id"), inst.get("agent_id")
@@ -478,7 +478,7 @@ def check_container():
         record("NOTE", "container gained a binary the docs call absent", ", ".join(surprises))
 
 
-def check_storage():
+def check_storage(cfg):
     dbdir = os.path.join(HOME_HOST, "data")
     db = os.path.join(dbdir, "openfang.db")
     if not os.path.exists(db):
@@ -504,7 +504,13 @@ def check_storage():
             listen = json.load(fh).get("listen_addr", "")
     except Exception:
         listen = ""
-    if listen.startswith("0.0.0.0"):
+    if listen.startswith("0.0.0.0") and (cfg.get("auth") or {}).get("enabled"):
+        record(
+            "OK",
+            "daemon application auth",
+            f"listen_addr={listen}; passkey sessions or the machine Bearer key are required",
+        )
+    elif listen.startswith("0.0.0.0"):
         record(
             "NOTE",
             "daemon listens on all interfaces",
@@ -555,10 +561,10 @@ def main():
         check_auth(key)
         check_provider_and_model(cfg, key)
         check_leaks(key, cfg_path)
-        check_cron()
-        check_hands()
+        check_cron(key)
+        check_hands(key)
     check_container()
-    check_storage()
+    check_storage(cfg)
     if args.full:
         check_openfang_doctor()
 
