@@ -13,7 +13,7 @@ v0.6.9. If you are running unmodified OpenFang, use that one instead.
 |---|---|
 | `SKILL.md` | the manual itself — daemon, agents, hands, cron, providers, channels, the API |
 | `references/` | eleven deep-dives loaded on demand: architecture, providers and models, hands, automation, the 65 builtin tools, the security model, skills and ClawHub, channels/MCP/A2A, known issues, a worked pipeline, and a fresh-server runbook |
-| `scripts/` | `ofctl` (authenticated API calls), `ofdoctor` (health pass with a secret-leak scan), `ofhand`, `ofcron`, `ofbackup`, `ofcheck-rs`, plus intake tools for YouTube and RuTube |
+| `scripts/` | `ofctl` (authenticated API calls), `ofdoctor` (health pass with a secret-leak scan), `ofhand`, `ofcron`, `ofbackup`, `ofcheck-rs`, `ofmutate` (proves a patch's test goes red without the patch), plus intake tools for YouTube and RuTube |
 | `evals/` | trigger evaluations for the skill description |
 
 ## Install
