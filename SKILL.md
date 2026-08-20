@@ -19,7 +19,7 @@ maintainer. Licence, the `librefang` fork, and the cherry-pick queue:
 
 | | |
 |---|---|
-| Source | `/opt/openfang`, branch `ours` at `d83abbf` (2026-08-14) — a fork of `RightNow-AI/openfang`, **19 commits ahead of upstream `main`** (`acf2587`, tag `v0.6.9`, 2026-05-12). Same repo, same commit, is checked out at `/root/src/openfang`. **13 crates**, no `openfang-mcp-bridge` |
+| Source | `/opt/openfang`, branch `ours` — a fork of `RightNow-AI/openfang`, ahead of upstream `main` (`acf2587`, tag `v0.6.9`, 2026-05-12). Same repo and branch (`ours`) is also checked out at `/root/src/openfang`, but the two are **not guaranteed to be at the same commit** — `/root/src/openfang` is where patches land first and can run ahead of what's actually built into the running image at `/opt/openfang`; check `git -C <path> log -1 --oneline` in both before assuming a line-number citation applies to the live container. **13 crates**, no `openfang-mcp-bridge` |
 | Container | `openfang-openfang-1`, image built from source (`docker compose up --build`; GHCR is private forever, #1254). Its `agents/` directory is empty, so #1206's ~1032 idle LLM turns/day does not apply here |
 | API | `http://127.0.0.1:4200` **and** `<tailnet-ip>:4200` (Tailscale `<tailnet-host>`) |
 | `OPENFANG_HOME` | `/data` in-container = `/var/lib/docker/volumes/openfang_openfang-data/_data` on host. Called `$D` from here down |
@@ -53,7 +53,7 @@ OpenFang, everything in this table reverts to the stock behaviour on its right �
 | Hot config reload | `ReloadPlan` splits `applied_actions` from `deferred_actions`; e.g. `ReloadProviderUrls` writes the catalog but is reported **deferred**, because `base_url` resolution still prefers the frozen boot-time `self.config` for any provider already in `[provider_urls]` (`kernel.rs:4253-4277`) | `hot_actions` reported as done regardless of whether anything in-process actually changed |
 | SQLite schema | `PRAGMA user_version = 9` (`openfang-memory/src/migration.rs:8`) | `user_version = 8` |
 | `file_read` | still `read_to_string`s the whole file first (unchanged — see Traps), but now takes `offset`/`limit` for paging and reports a truncation header (`openfang-runtime/src/tool_runner.rs:577-578,1387-1393`) | no `offset`/`limit`, no truncation header |
-| Channel adapters | Telegram no longer inlines the bot token into prompt text on a file fetch; Telegram + 5 more adapters (dingtalk, flock, gotify, threema, wecom) redact credentials out of `reqwest::Error` before it can be logged or surfaced (`acc85d7`, `crate::redact::redact_reqwest_error`) | a network error from any of those six could carry the token/key in its `Display` output |
+| Channel adapters | Telegram no longer inlines the bot token into prompt text on a file fetch; Telegram + 6 more adapters (dingtalk, flock, gotify, messenger, threema, wecom) redact credentials out of `reqwest::Error` before it can be logged or surfaced (`acc85d7`, `crate::redact::redact_reqwest_error`) | a network error from any of those seven could carry the token/key in its `Display` output |
 
 Everything **not** in this table — the 41 public routes, `POST /mcp` as a file-read primitive,
 TUI/CLI auth gaps, the vanishing hand, the 20-message cap, `shell_exec` with no pipes — is
@@ -232,8 +232,8 @@ on restart; the one function that writes to disk targets `/root/.openfang/hands`
 never reads. Use `upsert` for fast iteration, then `ofhand install`.
 
 Hand agent ids are stable. An **unnamed** instance gets `uuid5(NAMESPACE_DNS, hand_id)`
-(`kernel.rs:3936`); a **named** one derives from `"hand_instance_<instance_id>"` instead
-(`:3934`) — both via `AgentId::from_string` (`openfang-types/src/agent.rs:123-126`). Verified here:
+(`kernel.rs:4004`); a **named** one derives from `"hand_instance_<instance_id>"` instead
+(`:4002`) — both via `AgentId::from_string` (`openfang-types/src/agent.rs:123-126`). Verified here:
 `uuid5(NAMESPACE_DNS,"youtube-insights")` == the live agent `bf7564a1-2c88-5fdf-8ba7-24788d4da8c1`.
 So you can compute a hand's agent UUID before it exists, and it is why `ofhand set`
 (edit `hand_state.json`, restart) keeps cron jobs pointing at the same agent while
@@ -248,7 +248,7 @@ erroring, and `ofhand lint` fails the build on the first two and warns on the th
   number returns `None` and reverts to the default: `{"flag":true}` renders `Disabled` where
   `{"flag":"true"}` renders `Enabled` — `hands.md` §3.2.
 - **Omit `max_iterations`** unless you want an hourly autonomous loop. Its mere presence adds
-  `ScheduleMode::Continuous{3600}` on top of `AutonomousConfig` (`kernel.rs:3824-3841`).
+  `ScheduleMode::Continuous{3600}` on top of `AutonomousConfig` (`kernel.rs:3892-3906`).
 
 ### Cron (the only reliable scheduler)
 
@@ -381,7 +381,7 @@ Manual snapshot and restore procedure: `architecture.md` § Data locations.
   guard; that is *not* a write bypass — `security-model.md` §10.6c.)
 - **`POST /mcp` turns the API key into an arbitrary-file-read primitive.** `mcp_http` calls
   `execute_tool` with `allowed_tools=None`, `workspace_root=None`, `exec_policy=None`
-  (`routes.rs:7017-7112`), so `tools/call file_read {"path":"/data/secrets.env"}` returns
+  (`routes.rs:7216-7292`), so `tools/call file_read {"path":"/data/secrets.env"}` returns
   `HYPERFUSION_API_KEY` and `/data/config.toml` returns the key itself — verified live. All 65 tools
   are exposed. Only `shell_exec` is approval-gated, and if approved it skips `safe_bins` entirely.
 - Clearing `api_key` on Docker **locks you out**, it does not open the box: the container always sees
@@ -396,7 +396,7 @@ Manual snapshot and restore procedure: `architecture.md` § Data locations.
   any model id starting with it — silently, and the stripped id is **persisted**. This is #1195, real
   and unfixed. We are safe **only because the provider is named `hyperfusion`**; the `base_url` has
   nothing to do with it. Never rename the provider to `openai`.
-- An uncatalogued model gets a fabricated `$1/$3` per-M price (`metering.rs:203`) and a 200 000-token
+- An uncatalogued model gets a fabricated `$1/$3` per-M price (`metering.rs:289`) and a 200 000-token
   assumed context window. `available:true` in `/api/models` means nothing for a custom provider.
 - `POST /api/providers/{name}/test` false-negatives for 15 of 42 built-ins and 404s for custom ones.
 
@@ -413,15 +413,16 @@ Manual snapshot and restore procedure: `architecture.md` § Data locations.
 - stdout is truncated at a hardcoded 100 000 bytes; `exec_policy.max_output_bytes` (102 400) and
   `no_output_timeout_secs` are dead config. Subprocesses get `env_clear()` + 8 safe vars — they never
   see provider API keys.
-- `file_read` has **no size limit and no truncation** — `tokio::fs::read_to_string`
-  (`tool_runner.rs:1379-1388`) pulls the entire file into the daemon's memory *before* any context
-  budget applies, so size a file before reading it. The budget only trims what reaches the model:
+- `file_read` still has **no size limit on the read itself** — `tokio::fs::read_to_string`
+  (`tool_runner.rs:1381-1436`) pulls the entire file into the daemon's memory before `offset`/`limit`
+  slice it (the fork added the paging — see the delta table above), so size a file before reading
+  it. The budget only trims what reaches the model:
   tool results cap at 30 % of the context window (78 643 chars at 131 072), sessions compact at 75 %.
 - `tool_policy.rs` is dead code — **nothing is denied to a subagent by depth**. Use `tool_blocklist`.
 - `[capabilities] shell/network/memory_*/agent_message` are inert for LLM agents (WASM only). Only
   `capabilities.tools`, `tool_allowlist`/`tool_blocklist`, `profile` and `exec_policy` restrict one.
 - Any agent tagged `hand:*` **auto-approves every gated tool**, and a hand declaring `shell_exec`
-  is granted `ExecSecurityMode::Full` + 300 s automatically (`kernel.rs:3845-3848`).
+  is granted `ExecSecurityMode::Full` + 300 s automatically (`kernel.rs:3912-3921`).
 - LLM `agent_spawn` skips `validate_capability_inheritance` — a child can hold any capability.
 
 **Scheduling / lifecycle** (`automation-workflows-triggers-schedules.md`)
@@ -464,7 +465,9 @@ Don't rewrite these from scratch — they are known-good and already ran on this
 | `scripts/ofcron` | Create / list / enable / disable / run / rm, validating locally everything the API 400s on and resolving agent names to UUIDs. |
 | `scripts/ofbackup` | WAL-safe snapshot via SQLite's backup API + state tarball + a restore that strips stale `-wal`/`-shm`. |
 | `scripts/ofcheck-rs` | `cargo check`/`clippy` for a **fork source worktree**, run inside a container — no Rust toolchain needed on the host. `ofcheck-rs <worktree-path> [crate...]`. Each worktree gets its own build-target Docker volume (`fang-target-<slug>`); a shared one made cargo replay a stale fingerprint from a different worktree, silently returning the wrong worktree's result. First check per worktree is ~4.5 min, then incremental; a build target runs 5-12 GB, so free ≥12G before running it and `docker volume rm fang-target-<slug>` after a patch lands. For patching `/root/src/openfang` itself, not for operating the running instance. |
+| `scripts/ofmutate` | Mechanical red-before-green for a fork patch: `ofmutate <worktree> --test <filter> -p <crate>`. Runs the filtered test as committed (must be green **and** non-empty), reverse-applies only the patch's *production* hunks — Rust unit tests sit in the same file under `#[cfg(test)]`, so reverting whole files would delete the test along with the fix and prove nothing — then requires red, then restores the tree. `ДОКАЗАНО (RED-ASSERT)` is proof; `СЛАБОЕ КРАСНОЕ (RED-COMPILE)` only proves the test knows the new API, not that it checks its behaviour; `ТАВТОЛОГИЯ` (exit 1) and the `passed=0` refusal (exit 4, filter matched nothing) mean there is effectively no test. Refuses a dirty worktree (exit 2) and <12 GB free (exit 3 — the tool declining, **not** a patch defect). Shares `ofcheck-rs`'s build volume, so runs stay incremental: measured 203 s cold / 35 s warm on `openfang-runtime`. On its first real use it found a tautology in an existing fork patch (`fix/file-read-truncation`: `test_file_read_full_file_no_truncation_marker` passes with the fix reverted). |
 | `scripts/ytwatch.py` | Channel listing + caption fetch (no video download) + `seen.json` dedup. Written as a file precisely because `shell_exec` rejects pipes and redirection. Install: `docker exec openfang-openfang-1 mkdir -p /data/workspaces/<agent>/bin` then `docker cp ~/.claude/skills/fang-upgrade/scripts/ytwatch.py openfang-openfang-1:/data/workspaces/<agent>/bin/` (needs `pip3 install --break-system-packages yt-dlp` in the container). |
+| `scripts/rtwatch.py` | RuTube sibling of `ytwatch.py`, same design (flat argv, one JSON object per call, `seen.json` dedup) but not a drop-in: no RSS feed (uses `yt-dlp --flat-playlist`), subtitles are `srt` under `subtitles` not `automatic_captions` (`--write-subs`, not `--write-auto-subs`), and video ids are 32-char hex, not 11-char base64. Same install pattern as `ytwatch.py`, different filename. |
 | `assets/youtube-insights-hand/` | A complete working `HAND.toml` + `SKILL.md`. Start any new hand by copying this, not from a blank file. Install: `ofhand install ~/.claude/skills/fang-upgrade/assets/youtube-insights-hand`. `assets/README.md` covers the manual host-volume copy, why `docker cp <dir> …:/data/hands/<id>` silently nests and reloads the old definition, and the fact that the deployed copy still carries the unreachable `timeout_seconds: 240`. |
 
 ## Where to read more
@@ -474,7 +477,7 @@ need instead of reading the whole file.
 
 | File (`references/`) | Answers |
 |---|---|
-| `architecture.md` | Boot sequence, agent restore/kill/clone, agent loop, compaction, session repair, SQLite schema v8, `/data` layout, manual backup/restore, hot-reload gaps, shared-memory namespace |
+| `architecture.md` | Boot sequence, agent restore/kill/clone, agent loop, compaction, session repair, SQLite schema v9, `/data` layout, manual backup/restore, hot-reload gaps, shared-memory namespace |
 | `providers-and-models.md` | 42 providers / 205 catalog models (live `/api/models` total = 205 + custom entries), driver dispatch, `[default_model]`/`[provider_urls]`/`[provider_api_keys]`, custom providers + custom models, #1195 in full, fallback chains, routing, cost |
 | `hands.md` | Complete `HAND.toml` spec, settings/requirements semantics, the 9 bundled hands, lifecycle, hand API + CLI, a full worked custom-hand template |
 | `automation-workflows-triggers-schedules.md` | Workflows (step modes, `collect` bug), triggers (patterns, `describe_event`), cron (schema, tick loop, delivery), agent `[schedule]`, heartbeat, `/hooks/*` |

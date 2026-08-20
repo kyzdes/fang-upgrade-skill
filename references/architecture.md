@@ -1,10 +1,14 @@
 # OpenFang Runtime Architecture (verified against v0.6.9 source)
 
-Ground truth is the code at `/opt/openfang` tag `v0.6.9`. `docs/architecture.md` and
-`docs/configuration.md` in that checkout are aspirational in places — every place they
-diverge from code is called out explicitly below with file:line, and several were
-confirmed live against the running container (`openfang-openfang-1`, API on
-`127.0.0.1:4200`, image also `0.6.9`).
+Ground truth for the stock behaviour documented here is tag `v0.6.9` / commit `acf2587`, mirrored
+on the `main` branch of this repo. **`/opt/openfang` is not that checkout** — it now runs the fork
+(`ours`), several commits ahead; check `git -C /opt/openfang branch --show-current` before citing
+it as stock. `docs/architecture.md` and `docs/configuration.md` in the stock tree are aspirational
+in places — every place they diverge from code is called out explicitly below with file:line, and
+several were confirmed live against the running container (`openfang-openfang-1`, API on
+`127.0.0.1:4200`) — note the live container runs the fork, so where fork and stock differ, use
+`SKILL.md`'s "Fork vs stock v0.6.9" table, not this file, as the record of the live box's actual
+behaviour.
 
 ## Table of contents
 
@@ -632,6 +636,13 @@ detected-only are enumerated together:
 > overrides, skills, usage footer, web config, browser, webhook triggers, extensions, MCP servers,
 > A2A config.
 
+**Caveat on "default model" being in the applied list**: it is only partially true. The override
+slot is read by `resolve_driver` on every message, so a changed key/`base_url`/timeout do take
+effect immediately — but the default model itself is overlaid onto an agent manifest only at load
+time (`config_reload.rs:23-27`), so changing `[default_model].model` and reloading will not switch
+the model of an agent that is already running; it takes effect only for agents spawned after the
+reload (or restarted). Do not read "applied" here as "every running agent switched model".
+
 A changed field ends up in one of two places, and only one of them can act without a restart.
 `build_reload_plan` (`config_reload.rs`) pushes **4** kinds of change into `restart_reasons` —
 those never produce a `HotAction` at all — and **13** into `hot_actions`. Of those 13,
@@ -641,8 +652,10 @@ rest, and the split is **4 applied / 9 deferred**: `UpdateApprovalPolicy`, `Upda
 explicitly deferred despite writing the catalog (see below); the remaining eight — channels,
 skills, web, browser, webhook, extensions, MCP servers, A2A — fall through the catch-all with
 "noted but not yet auto-applied".
-had exactly one catch-all branch for everything not individually handled ("noted but not yet
-auto-applied") and the API returned only `plan.hot_actions` — an operator polling
+
+Before this fork’s split, stock `apply_hot_actions` had exactly one catch-all branch for
+everything not individually handled ("noted but not yet auto-applied") and the API returned only
+`plan.hot_actions` — an operator polling
 `POST /api/config/reload` had no field to distinguish "the daemon just did this" from "the daemon
 logged this and changed nothing." `POST /api/config/reload`'s response now reports `status`
 (`"applied"` / `"partial"` / `"no_changes"` / `"error"`), `hot_actions_applied`,

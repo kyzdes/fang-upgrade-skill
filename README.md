@@ -13,7 +13,7 @@ v0.6.9. If you are running unmodified OpenFang, use that one instead.
 |---|---|
 | `SKILL.md` | the manual itself — daemon, agents, hands, cron, providers, channels, the API |
 | `references/` | eleven deep-dives loaded on demand: architecture, providers and models, hands, automation, the 65 builtin tools, the security model, skills and ClawHub, channels/MCP/A2A, known issues, a worked pipeline, and a fresh-server runbook |
-| `scripts/` | `ofctl` (authenticated API calls), `ofdoctor` (health pass with a secret-leak scan), `ofhand`, `ofcron`, `ofbackup`, `ofcheck-rs`, plus intake tools for YouTube and RuTube |
+| `scripts/` | `ofctl` (authenticated API calls), `ofdoctor` (health pass with a secret-leak scan), `ofhand`, `ofcron`, `ofbackup`, `ofcheck-rs`, `ofmutate` (proves a patch's test goes red without the patch), plus intake tools for YouTube and RuTube |
 | `evals/` | trigger evaluations for the skill description |
 
 ## Install
@@ -47,11 +47,12 @@ Addresses and host names appear as `<tailnet-ip>`, `<public-ip>`, `<tailnet-host
 your own. Paths assume the Docker install described in
 [fang-upgrade/INSTALL-AGENT.md](https://github.com/kyzdes/fang-upgrade/blob/main/INSTALL-AGENT.md).
 
-**A caveat worth reading before you trust a section.** This skill grew as an operator manual for
-stock v0.6.9 and is being brought in line with the fork. Where the fork changed behaviour —
-per-call usage metering with model disclosure, `file_read` paging, a `501` that names the working
-routes, redacted channel credentials — some sections may still describe the older shape. Those are
-being corrected; until then, when the manual and the running daemon disagree, **the daemon is
-right**. Reporting the mismatch is more useful than working around it.
+**A caveat worth reading before you trust a section.** `SKILL.md`'s "Fork vs stock v0.6.9" table is
+the enumerated list of everywhere the fork's behaviour differs from stock; everything **not** in
+that table is unchanged from stock and covered once, under Traps — silence there means "same as
+stock," not "not yet checked." That said, every line in every file was verified against the code
+and/or the live daemon at the time it was written, not against each other, so if a section and the
+running daemon still disagree, **the daemon is right**. Reporting the mismatch is more useful than
+working around it.
 
 Licence: same as upstream OpenFang, Apache-2.0 OR MIT.

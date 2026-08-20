@@ -144,7 +144,7 @@ never from TOML.
 | `base_url` | string | no | none | |
 | `max_tokens` | u32 | no | `4096` | |
 | `temperature` | f32 | no | `0.7` | |
-| `max_iterations` | u32 | no | none | **The autonomy switch.** Present → `AutonomousConfig{max_iterations}` (`kernel.rs:3824-3831`) **and** `ScheduleMode::Continuous{check_interval_secs: 3600}` (`kernel.rs:3835-3841`). Absent → `ScheduleMode::default()` (Reactive; only runs on incoming messages). |
+| `max_iterations` | u32 | no | none | **The autonomy switch.** Present → `AutonomousConfig{max_iterations}` (`kernel.rs:3892-3898`) **and** `ScheduleMode::Continuous{check_interval_secs: 3600}` (`kernel.rs:3902-3906`). Absent → `ScheduleMode::default()` (Reactive; only runs on incoming messages). |
 | `heartbeat_interval_secs` | u64 | no | `30` | Only meaningful with `max_iterations`. Kernel default 30 s is too aggressive for long LLM calls; only `researcher` overrides it (120). |
 
 > **Verified trap:** omit `provider`/`model` and your hand silently targets Anthropic
@@ -157,7 +157,7 @@ The kernel also derives, from the hand definition:
 
 * **`exec_policy`** — if `tools` contains `shell_exec`, the agent gets
   `ExecSecurityMode::Full`, `timeout_secs = 300`, `no_output_timeout_secs = 120`
-  (`kernel.rs:3845-3854`, the `mode` line is `:3847`). Hands are treated as curated packages: **declaring `shell_exec` routes
+  (`kernel.rs:3912-3921`, the `mode` line is `:3915`). Hands are treated as curated packages: **declaring `shell_exec` routes
   commands through `sh -c` and skips the `safe_bins`/`allowed_commands` allowlist** that ordinary
   agents get (`tool_runner.rs:1650-1700`), plus the taint heuristics (`tool_runner.rs:277-288`).
   It does **not** buy you shell operators — `contains_shell_metacharacters` runs at
@@ -556,7 +556,7 @@ Two-way secret sync between a self-hosted Infisical instance and the local crede
 4. If an agent with the target name already exists: snapshot its triggers and cron jobs, `kill_agent`
    it, respawn, then restore triggers (#519) and cron jobs.
 5. Spawn with a **deterministic** agent UUID: `AgentId::from_string(hand_id)` for unnamed instances,
-   `AgentId::from_string("hand_instance_<instance_uuid>")` for named ones — the two calls are at `kernel.rs:3936` (unnamed) and `:3934` (named).
+   `AgentId::from_string("hand_instance_<instance_uuid>")` for named ones — the two calls are at `kernel.rs:4004` (unnamed) and `:4002` (named).
    Unnamed `clip` therefore always gets the same agent UUID across restarts.
 6. `set_agent(instance_id, agent_id)` and `persist_hand_state()`.
 7. The API layer additionally starts the background loop when the schedule is non-Reactive
@@ -780,7 +780,7 @@ Omitting them yields `anthropic` / `claude-sonnet-4-20250514` (`lib.rs:306-311`)
 Write `provider = "default"` and `model = "default"`.
 
 ### 9.9 Gotcha: `shell_exec` in a hand means an un-allowlisted shell — but still not a real shell
-`kernel.rs:3845-3854` grants `ExecSecurityMode::Full` whenever the tool list contains `shell_exec`,
+`kernel.rs:3912-3921` grants `ExecSecurityMode::Full` whenever the tool list contains `shell_exec`,
 which routes commands through `sh -c` (instead of `shlex` argv-splitting) and skips both
 `validate_command_allowlist` and the taint heuristics. **The metacharacter denylist still applies** —
 `contains_shell_metacharacters` runs first, at `tool_runner.rs:249`, in every mode. So a hand can run

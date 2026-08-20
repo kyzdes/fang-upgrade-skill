@@ -253,6 +253,13 @@ tool_runner.rs:130). Of the 65 schemas, `file_read` is the only one the fork cha
   it gets you a truncated result whose header is *rewritten* by `rewrite_paging_header`
   (`context_budget.rs:110-151`) to state what was actually delivered, not what `file_read` originally
   promised. See §2 for the two-layer mechanics.
+  **Reading a large file to completion**: don't pass a `limit` bigger than the budget and expect
+  it honored — instead loop, using the header's own numbers to drive the next call: start with
+  `file_read {path}` (or `{path, offset:0}`), read the reported `end` back out of the header
+  (`... returned bytes {start}-{end} of {total} ...`), and call again with `offset={end}` until the
+  header says `"; this is the end of the file.]"` or `remaining` is 0. Each call still `read_to_string`s
+  the whole file server-side regardless of where you resume — this loop bounds what reaches the
+  model, not what the daemon reads off disk per call.
 - **`file_write`** `{path, content: string, both required}` → creates parent dirs, overwrites,
   returns `"Successfully wrote N bytes to <path>"`.
 - **`file_list`** `{path: string, required}` → directory listing (`std::fs::read_dir`, names only).

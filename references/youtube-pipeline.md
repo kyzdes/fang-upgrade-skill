@@ -102,7 +102,7 @@ Other `shell_exec` facts (`tool_runner.rs:1630-1760`):
   wins, so anything above 120 s is inert unless you set `OPENFANG_TOOL_TIMEOUT_SECS` on the daemon —
   which is **not set on this box** (the container env holds only `OPENFANG_LISTEN` and
   `OPENFANG_HOME`). See `tools-reference.md` §1 for all three timeout layers.
-- stdout is truncated at a hardcoded `100_000` bytes (`tool_runner.rs:1741`).
+- stdout is truncated at a hardcoded `100_000` bytes (`tool_runner.rs:1789`).
   `exec_policy.max_output_bytes` is dead config — grep shows it is only read in a test.
   `no_output_timeout_secs` is likewise never applied to `shell_exec`.
 - Child env is `env_clear()`ed and only `PATH HOME TMPDIR TMP TEMP LANG LC_ALL TERM`
@@ -316,7 +316,7 @@ network, nothing to do", produced an empty table, and **the cron job still recor
 
 ### 3.1 Why a hand rather than a plain agent
 
-`kernel.rs:3845-3854` (the `mode` line is `:3847`): if a hand's `tools` list contains `shell_exec`, the kernel
+`kernel.rs:3912-3921` (the `mode` line is `:3915`): if a hand's `tools` list contains `shell_exec`, the kernel
 hands it, automatically and with no config file:
 
 ```rust
@@ -328,7 +328,7 @@ exec_policy: if def.tools.iter().any(|t| t == "shell_exec") {
 
 Confirmed in the live log: `Agent exec_policy resolved agent=youtube-insights
 exec_mode=Some(Full)`. A hand also gets a **stable agent UUID** derived from the hand
-id (`kernel.rs:3936`, `AgentId::from_string(hand_id)` = UUIDv5/DNS; named instances take the
+id (`kernel.rs:4004`, `AgentId::from_string(hand_id)` = UUIDv5/DNS; named instances take the
 `:3934` branch and derive from `hand_instance_<instance_uuid>` instead):
 
 ```python
@@ -369,7 +369,7 @@ copy the final file to `/data/hands/` so it survives.
 
 ### 3.3 `max_iterations` in `[agent]` is a booby trap
 
-`kernel.rs:3824-3841`:
+`kernel.rs:3892-3906`:
 
 ```rust
 autonomous: def.agent.max_iterations.map(|max_iter| AutonomousConfig { ... }),

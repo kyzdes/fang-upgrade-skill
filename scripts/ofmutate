@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# ofmutate <worktree> --test <фильтр> [--base REF] [-p КРЕЙТ]... [--per-hunk] [--dry-run]
+#
+# Механическая проверка «красное до зелёного» ПОСЛЕ факта: тест уже написан и зелёный,
+# и надо доказать, что он покраснеет без патча. Порядок работы это не навязывает —
+# оно проверяет результат, а результат проверяем именно потому, что за пять спринтов
+# десять тестов оказались тавтологиями (проходили и до патча, и после).
+#
+# Что делает:
+#   1. прогон КАК ЕСТЬ — тест обязан пройти, и обязан быть непустым (см. ниже);
+#   2. откат продакшн-ханков патча (тестовые ханки остаются на месте) — тест обязан упасть;
+#   3. восстановление дерева.
+#
+# Почему ханки, а не файлы. В Rust юнит-тесты лежат в ТОМ ЖЕ файле под `#[cfg(test)]`.
+# Откат файла целиком снёс бы вместе с патчем и тест, тест перестал бы существовать, и
+# «упало» ничего не значило бы. Поэтому патч режется по ханкам: ханк, чей новый диапазон
+# строк попадает внутрь модуля `#[cfg(test)]`, считается тестовым и НЕ откатывается.
+#
+# Пустой прогон — отдельный отказ, а не успех. `cargo test <фильтр>` при опечатке в
+# фильтре печатает `test result: ok. 0 passed` и код 0. Именно так выглядит тест-тавтология
+# в самой чистой форме: зелено, потому что не запускалось ничего. Поэтому этап 1 требует
+# passed >= 1, иначе выход 4.
+#
+# Различие двух красных, оно важно:
+#   RED-ASSERT  — тест собрался и упал на утверждении. Это доказательство: тест смотрит
+#                 на поведение, которое ввёл патч.
+#   RED-COMPILE — без патча тест не собирается (зовёт функцию, которой ещё нет). Это
+#                 слабее: доказано только, что тест ЗНАЕТ о новом API, но не то, что он
+#                 проверяет его поведение. Такой тест мог бы вызвать новую функцию и не
+#                 проверить результат. Тогда нужен --per-hunk: он откатывает ханки по
+#                 одному и показывает, какие из них тест не замечает вовсе.
+#
+# Прогон идёт в том же контейнере и на том же томе цели сборки, что ofcheck-rs
+# (fang-target-<basename>-), поэтому сборка инкрементальная и лишнего места не съедает.
+# Имя тома воспроизводит поведение ofcheck-rs дословно, включая завершающий дефис от
+# `tr` над переводом строки — расхождение в имени стоило бы холодной сборки на ~4.5 мин.
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+# Тот же порог, что в ofcheck-rs. Переопределяется переменной среды только затем, чтобы
+# сам отказ по диску можно было прогнать (иначе это ветка, которая никогда не проверялась).
+DISK_MIN_G = int(os.environ.get("OFMUTATE_DISK_MIN_G", "12"))
+IMAGE = "rust:1-slim-bookworm"
+APT = ("apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq "
+       "pkg-config libssl-dev perl make >/dev/null 2>&1;")
+
+
+def die(msg, code=2):
+    print(f"ofmutate: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def git(wt, *args, check=True):
+    r = subprocess.run(["git", "-C", wt, *args],
+                       capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"git {' '.join(args)} → {r.returncode}\n{r.stderr.strip()}")
+    return r.stdout
+
+
+def free_gb():
+    r = subprocess.run(["df", "-BG", "--output=avail", "/"],
+                       capture_output=True, text=True)
+    return int(re.sub(r"\D", "", r.stdout.strip().splitlines()[-1]) or 0)
+
+
+def volume_slug(wt):
+    """Имя тома ровно как его строит ofcheck-rs: basename, затем tr -c над
+    выводом basename — а тот выводит ещё и \\n, который tr превращает в '-'."""
+    base = os.path.basename(os.path.normpath(wt)) + "\n"
+    return "".join(c if re.match(r"[a-zA-Z0-9_.-]", c) else "-" for c in base)
+
+
+def test_module_ranges(text):
+    """Диапазоны строк (1-based, включительно) модулей `#[cfg(test)]` в тексте файла.
+    Скобки считаются грубо — построчно, без разбора строковых литералов; для
+    `mod tests { ... }` этого достаточно, а промах виден в инвентаре ханков,
+    который печатается до любого действия."""
+    lines = text.splitlines()
+    ranges = []
+    i = 0
+    while i < len(lines):
+        if re.match(r"\s*#\[cfg\(test\)\]", lines[i]):
+            # ищем открывающую скобку модуля
+            j = i
+            while j < len(lines) and "{" not in lines[j]:
+                j += 1
+            if j >= len(lines):
+                ranges.append((i + 1, len(lines)))
+                break
+            depth = 0
+            k = j
+            while k < len(lines):
+                depth += lines[k].count("{") - lines[k].count("}")
+                if depth <= 0:
+                    break
+                k += 1
+            end = min(k, len(lines) - 1) + 1
+            ranges.append((i + 1, end))
+            i = end
+        else:
+            i += 1
+    return ranges
+
+
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def split_hunks(wt, base, head):
+    """[(файл, индекс-ханка, новая-строка-начала, тестовый?, текст-ханка)] по всему патчу."""
+    files = [f for f in git(wt, "diff", "--name-only",
+                            f"{base}...{head}").splitlines() if f]
+    out = []
+    for f in files:
+        diff = git(wt, "diff", f"{base}...{head}", "--", f)
+        if not diff.strip():
+            continue
+        header, *rest = re.split(r"(?m)^(?=@@ )", diff, maxsplit=1)
+        if not rest:
+            continue
+        ranges = []
+        if f.endswith(".rs"):
+            try:
+                ranges = test_module_ranges(git(wt, "show", f"{head}:{f}"))
+            except SystemExit:
+                ranges = []
+        hunks = re.split(r"(?m)^(?=@@ )", rest[0])
+        for n, h in enumerate([x for x in hunks if x.strip()], 1):
+            m = HUNK_RE.match(h)
+            if not m:
+                continue
+            start = int(m.group(1))
+            span = int(m.group(2) or 1)
+            mid = start + span // 2
+            is_test = any(a <= mid <= b for a, b in ranges)
+            out.append({"file": f, "n": n, "start": start, "span": span,
+                        "test": is_test, "text": header + h, "diff_header": header})
+    return out
+
+
+def run_tests(wt, crates, filt, label, logdir):
+    slug = volume_slug(wt)
+    tgt = f"fang-target-{slug}"
+    subprocess.run(["docker", "volume", "create", tgt],
+                   capture_output=True, check=True)
+    subprocess.run(["docker", "volume", "create", "fang-cargo-registry"],
+                   capture_output=True, check=True)
+    pargs = " ".join(f"-p {c}" for c in crates) or "--workspace"
+    cmd = f"{APT} cargo test {pargs} {filt}".strip()
+    t0 = time.time()
+    r = subprocess.run(
+        ["docker", "run", "--rm",
+         "-v", f"{wt}:/build:ro",
+         "-v", f"{tgt}:/target",
+         "-v", "fang-cargo-registry:/usr/local/cargo/registry",
+         "-w", "/build",
+         "-e", "CARGO_TARGET_DIR=/target",
+         "-e", "CARGO_TERM_COLOR=never",
+         IMAGE, "sh", "-c", cmd],
+        capture_output=True, text=True)
+    out = r.stdout + r.stderr
+    log = os.path.join(logdir, f"{label}.log")
+    with open(log, "w") as fh:
+        fh.write(cmd + "\n\n" + out)
+    passed = sum(int(m) for m in re.findall(r"(\d+) passed", out))
+    failed = sum(int(m) for m in re.findall(r"(\d+) failed", out))
+    if re.search(r"could not compile|^error\[E\d+\]", out, re.M):
+        verdict = "RED-COMPILE"
+    elif "test result: FAILED" in out or failed > 0 or "panicked at" in out:
+        verdict = "RED-ASSERT"
+    elif "test result: ok" in out:
+        verdict = "GREEN"
+    else:
+        verdict = "UNKNOWN"
+    return {"verdict": verdict, "passed": passed, "failed": failed,
+            "log": log, "secs": int(time.time() - t0), "out": out,
+            "rc": r.returncode}
+
+
+def show(res, label):
+    print(f"  {label}: {res['verdict']}  passed={res['passed']} "
+          f"failed={res['failed']}  {res['secs']}s  → {res['log']}")
+
+
+def apply_reverse(wt, hunks, patchdir, tag):
+    """Откатить перечисленные ханки в рабочем дереве. Возвращает путь к патчу."""
+    path = os.path.join(patchdir, f"{tag}.patch")
+    with open(path, "w") as fh:
+        by_file = {}
+        for h in hunks:
+            by_file.setdefault(h["file"], []).append(h)
+        for f, hs in by_file.items():
+            fh.write(hs[0]["diff_header"])
+            for h in hs:
+                fh.write(h["text"][len(h["diff_header"]):])
+    r = subprocess.run(["git", "-C", wt, "apply", "--reverse", "--verbose", path],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"откат ханков не применился, дерево не тронуто:\n{r.stderr.strip()}", 5)
+    return path
+
+
+def restore(wt, files):
+    subprocess.run(["git", "-C", wt, "checkout", "HEAD", "--", *files],
+                   capture_output=True, check=False)
+    left = git(wt, "status", "--porcelain", check=False).strip()
+    if left:
+        print("ofmutate: ВНИМАНИЕ, дерево не вернулось в исходное состояние:\n"
+              + left, file=sys.stderr)
+        return False
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("worktree")
+    ap.add_argument("--test", required=True,
+                    help="фильтр cargo test; пустой прогон считается отказом")
+    ap.add_argument("--base", default="ours")
+    ap.add_argument("-p", "--crate", action="append", default=[])
+    ap.add_argument("--per-hunk", action="store_true",
+                    help="дополнительно откатить каждый ханк по одному")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="только инвентарь ханков, ничего не запускать и не менять")
+    a = ap.parse_args()
+
+    # Прогон длится минуты. При перенаправлении в файл stdout блочно буферизуется,
+    # и до конца работы не видно ни этапа, ни того, что инструмент вообще жив.
+    sys.stdout.reconfigure(line_buffering=True)
+
+    wt = os.path.abspath(a.worktree)
+    if not os.path.isdir(wt):
+        die(f"нет каталога: {wt}")
+
+    # Цель отката доказывается ДО отката: дерево должно быть чистым, иначе
+    # восстановление затрёт незакоммиченную работу.
+    dirty = git(wt, "status", "--porcelain").strip()
+    if dirty:
+        die("рабочее дерево не чистое — откат ханков затёр бы эти изменения:\n"
+            + dirty + "\n  закоммить или спрячь их и повтори", 2)
+
+    git(wt, "rev-parse", "--verify", a.base)
+    head = git(wt, "rev-parse", "HEAD").strip()
+    if not git(wt, "diff", "--name-only", f"{a.base}...{head}").strip():
+        die(f"HEAD не отличается от {a.base} — откатывать нечего", 2)
+
+    hunks = split_hunks(wt, a.base, head)
+    prod = [h for h in hunks if not h["test"]]
+    tests = [h for h in hunks if h["test"]]
+
+    print(f"# worktree {wt}")
+    print(f"# HEAD {head[:9]}  база {a.base}  фильтр '{a.test}'")
+    print(f"# ханков: {len(prod)} продакшн, {len(tests)} тестовых")
+    for h in hunks:
+        kind = "тест " if h["test"] else "прод "
+        print(f"    {kind} {h['file']}  @@+{h['start']},{h['span']}")
+    if not prod:
+        die("продакшн-ханков нет — патч состоит из одних тестов, "
+            "откатывать нечего", 2)
+    if a.dry_run:
+        return 0
+
+    if free_gb() < DISK_MIN_G:
+        die(f"свободно {free_gb()}G, целям сборки нужно ~{DISK_MIN_G}G. "
+            "Это отказ инструмента, НЕ дефект патча: "
+            "docker volume rm fang-target-<slug>", 3)
+
+    logdir = tempfile.mkdtemp(prefix="ofmutate-")
+    print(f"# логи: {logdir}")
+    files = sorted({h["file"] for h in prod})
+
+    print("\n[1/2] как есть — обязано быть зелёным и непустым")
+    g = run_tests(wt, a.crate, a.test, "green", logdir)
+    show(g, "как есть")
+    if g["verdict"] != "GREEN":
+        print(f"\nОТКАЗ: с патчем тест не проходит ({g['verdict']}). "
+              "Доказывать нечего.", file=sys.stderr)
+        return 1
+    if g["passed"] < 1:
+        print(f"\nОТКАЗ: фильтр '{a.test}' не выбрал ни одного теста "
+              "(passed=0). Зелёный пустой прогон — это тавтология, "
+              "а не доказательство.", file=sys.stderr)
+        return 4
+
+    print(f"\n[2/2] продакшн-ханки откачены ({len(prod)} шт.) — обязано покраснеть")
+    apply_reverse(wt, prod, logdir, "prod-revert")
+    try:
+        r = run_tests(wt, a.crate, a.test, "red-all", logdir)
+    finally:
+        ok = restore(wt, files)
+    show(r, "без патча")
+
+    per = []
+    if a.per_hunk and len(prod) > 1:
+        print(f"\n[+] по одному ханку ({len(prod)} прогонов)")
+        for h in prod:
+            apply_reverse(wt, [h], logdir, f"h{h['n']}-{os.path.basename(h['file'])}")
+            try:
+                rr = run_tests(wt, a.crate, a.test,
+                               f"red-{h['file'].replace('/', '_')}-{h['n']}", logdir)
+            finally:
+                restore(wt, [h["file"]])
+            show(rr, f"{h['file']} @@+{h['start']}")
+            per.append((h, rr))
+
+    print("\n=== вердикт ===")
+    if not ok:
+        print("ДЕРЕВО НЕ ВОССТАНОВЛЕНО — разберись с этим раньше вердикта")
+        return 6
+    if r["verdict"] == "RED-ASSERT":
+        print(f"ДОКАЗАНО (RED-ASSERT): с патчем {g['passed']} passed; без него "
+              f"{r['failed']} failed. Тест смотрит на поведение патча.")
+        rc = 0
+    elif r["verdict"] == "RED-COMPILE":
+        print("СЛАБОЕ КРАСНОЕ (RED-COMPILE): без патча тест не собирается. "
+              "Доказано, что он знает о новом API, НЕ доказано, что проверяет "
+              "его поведение. Нужен ещё один тест, падающий на утверждении, "
+              "или --per-hunk.")
+        rc = 0
+    elif r["verdict"] == "GREEN":
+        print(f"ТАВТОЛОГИЯ: без патча тест всё равно проходит "
+              f"({r['passed']} passed). Тест не проверяет патч.")
+        rc = 1
+    else:
+        print(f"НЕЯСНО ({r['verdict']}) — читай {r['log']} глазами")
+        rc = 1
+    for h, rr in per:
+        if rr["verdict"] == "GREEN":
+            print(f"  НЕ ПОКРЫТ: {h['file']} @@+{h['start']},{h['span']} — "
+                  "тест не замечает откат этого ханка")
+    print(f"логи прогонов: {logdir}")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

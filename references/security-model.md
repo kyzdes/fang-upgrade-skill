@@ -1,8 +1,14 @@
-# OpenFang Security Model — v0.6.9 (source of truth: `/opt/openfang` @ tag `v0.6.9`, commit `acf2587`)
+# OpenFang Security Model — v0.6.9 (source of truth: tag `v0.6.9` / commit `acf2587`, mirrored on
+this repo's `main` branch)
 
 Everything below was read out of the v0.6.9 tree and, where marked **[verified live]**, reproduced
-against the running container `openfang-openfang-1` (API `http://127.0.0.1:4200`, `OPENFANG_HOME=/data`).
-Where `docs/security.md` disagrees with the code, the code wins and the disagreement is called out.
+against the running container `openfang-openfang-1` (API `http://127.0.0.1:4200`, `OPENFANG_HOME=/data`)
+— that container now runs the fork (`ours`), not a stock build, so a **[verified live]** tag here
+means the stock behaviour described was also confirmed on the fork, not that the fork's own
+changes are covered; those are in `SKILL.md`'s "Fork vs stock v0.6.9" table and §1.8 below.
+**`/opt/openfang` is not a tag `v0.6.9` checkout** — it runs `ours`, ahead of `acf2587`; don't cite
+it as stock. Where `docs/security.md` disagrees with the code, the code wins and the disagreement
+is called out.
 
 ---
 
@@ -263,7 +269,7 @@ are ungated unless you add them to `[approval] require_approval`.
 
 ### 3.4 `docker_exec` is not a sandbox for `shell_exec`
 
-`tool_docker_exec` (`tool_runner.rs:3277-3324`) is a *separate tool*. It checks only
+`tool_docker_exec` (`tool_runner.rs:3325-3369`) is a *separate tool*. It checks only
 `docker_config.enabled`, then creates a container (workspace bind-mounted) and runs the command.
 
 Be precise about what is and is not missing (an earlier pass of this file overstated it):

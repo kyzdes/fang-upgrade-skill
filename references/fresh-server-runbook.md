@@ -36,7 +36,7 @@ docker version --format '{{.Server.Version}}'
 
 ```bash
 mkdir -p /opt && cd /opt
-git clone https://github.com/kyzdes/openfang-patched.git openfang
+git clone https://github.com/kyzdes/fang-upgrade.git openfang
 cd /opt/openfang
 ```
 
@@ -220,22 +220,23 @@ curl -s -m 600 -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: applica
 
 ---
 
-## 7. Скилл `openfang`
+## 7. Скилл `fang-upgrade`
 
 Скилл — это набор инструкций и утилит (`ofctl`, `ofdoctor`, `ofhand`, `ofcron`, `ofbackup`),
 который избавляет от ручной возни с curl и Bearer-заголовками.
 
 ```bash
 mkdir -p ~/.claude/skills
-git clone https://github.com/kyzdes/openfang-skill-private.git ~/.claude/skills/openfang
-chmod +x ~/.claude/skills/openfang/scripts/*
-export PATH="$HOME/.claude/skills/openfang/scripts:$PATH"
-echo 'export PATH="$HOME/.claude/skills/openfang/scripts:$PATH"' >> ~/.bashrc
+git clone https://github.com/kyzdes/fang-upgrade-skill.git ~/.claude/skills/fang-upgrade
+chmod +x ~/.claude/skills/fang-upgrade/scripts/*
+export PATH="$HOME/.claude/skills/fang-upgrade/scripts:$PATH"
+echo 'export PATH="$HOME/.claude/skills/fang-upgrade/scripts:$PATH"' >> ~/.bashrc
 ```
 
-Репозиторий приватный — нужен доступ к GitHub-аккаунту владельца (`gh auth login` либо
-деплой-ключ). Если доступа нет, скилл не обязателен: всё в этом документе делается голым
-`curl`, скилл лишь удобнее.
+Репозиторий публичный, доступ не нужен. (Есть отдельный `kyzdes/openfang-skill-private` —
+это deployment-specific скилл с адресами и путями этого конкретного хоста, другой инструмент;
+не путать.) Если клонировать не хочется, скилл не обязателен: всё в этом документе делается
+голым `curl`, скилл лишь удобнее.
 
 **Проверка:**
 ```bash
@@ -290,7 +291,7 @@ docker inspect openfang-openfang-1 --format '{{.Image}}'
 | агент «забывает» после ~20 сообщений | штатное окно сессии, `POST /api/agents/{id}/session/reset` |
 | `Max iterations exceeded` → HTTP 500 | лимит итераций мал. Правило: свод по N файлам требует `max_iterations >= N + 3`. Поменять без пересоздания агента нельзя |
 | ход упал по лимиту — расход не записался | известный дефект, учёт теряется целиком |
-| документ вышел вдвое тоньше ожидаемого | две причины: подмена модели (в форке видна в ответе) и `file_read`, который режет файл до доли контекстного окна и об этом не сообщает |
+| документ вышел вдвое тоньше ожидаемого | две причины: подмена модели (в форке видна в ответе) и слой контекстного бюджета, который режет крупный результат `file_read` до 30% окна — он это сообщает (`[TRUNCATED: ...]`, `context_budget.rs:87-91`), но сообщение легко пропустить в потоке вывода |
 | `hand` исчез после `docker restart` | известная ловушка v0.6.9 |
 | канал Telegram в цикле `409 Conflict` | ту же очередь читает кто-то ещё. Telegram допускает одного читателя; искать второй экземпляр с тем же токеном |
 
