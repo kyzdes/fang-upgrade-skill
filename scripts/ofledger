@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+# ofledger --dir <путь-к-workflows> [--since YYYY-MM-DD] [--json]
+#
+# (usage-строка выше исправлена вслед за кодом: argparse требует --dir,
+#  required=True; до правки 2026-08-21 строка использования показывала его
+#  необязательным — расхождение подписи с кодом, а не поведения.)
+#
+# Каждый сабагент этого форка обязан вернуть в отчёте поле «несделано» (в русских
+# прогонах) / "unfinished" / "unverified" (в англоязычных) — прямой список того, чего
+# он не проверял. Это поле — лучшее, что есть в отчётах периода, и у него нет читателя:
+# один и тот же пропуск («пять дорогих репро не прогонялись», «cargo test --workspace
+# не собирается без glib-2.0») записывается заново в каждом следующем прогоне, потому
+# что никто не сверяет текущий отчёт с предыдущими. ofledger читает
+# ~/.claude/projects/.../workflows/wf_*.json и сводит их.
+#
+# СХЕМА (проверено на файлах wf_*.json сессии 36e33475-5806-47d9-96d6-78d2640c1637 —
+# число файлов в этой сессии РАСТЁТ по ходу работы других агентов, поэтому конкретную
+# цифру здесь не фиксируем: на 2026-08-21 `ls .../workflows/wf_*.json | wc -l` дал 22,
+# «scripts/» — это подкаталог рядом, не файл прогона, и в счёт не входит; не выведена
+# из описания задания — оно частично разошлось с фактом, см. ниже):
+#   runId, timestamp, workflowName, status, agentCount, totalTokens, totalToolCalls,
+#   durationMs — плоские поля прогона.
+#   result — то, что вернул скрипт задания. В разных прогонах это то dict, то list
+#   dict-ов; поля внутри произвольные (плоско или вложенно), общего контракта нет.
+#   Поле с «несделанным» встречалось ТОЛЬКО под ключами "несделано" и "unfinished".
+#   Ключи "unverified" и "not_done", которые называло задание, в файлах на момент
+#   первой сборки инструмента не встретились ни разу — это расхождение задания с
+#   данными, а не опечатка сборщика; ofledger ищет оба набора ключей (несделано/
+#   unfinished/unverified/not_done) на случай будущих прогонов, но подтверждён на
+#   данных на тот момент только первый.
+#   Значение поля — почти всегда строка (иногда многострочная, с нумерованным списком
+#   внутри), один раз null. Списков-значений в исходных данных не встретилось, но код
+#   принимает и их на случай будущего формата.
+#   workflowProgress — список; элементы с type == "workflow_agent" несут label, model,
+#   state (done/error/start/progress), attempt (None или 1 в этих данных — заметьте,
+#   что ни один прогон здесь не содержит attempt > 1, то есть колонка «было переиграно»
+#   ниже во всех прочитанных на тот момент файлах всегда покажет 0; это тоже расхождение с формулировкой
+#   задания, которая ожидала повторные попытки), tokens, toolCalls, durationMs, error,
+#   phaseTitle.
+#
+# НОРМАЛИЗАЦИЯ И ГРУППИРОВКА ПОВТОРОВ (главная часть, и она эвристика, а не парсер).
+# Версия 2026-08-21: первая версия (2026-08-20) склеивала мусор — состязательный
+# разбор насчитал 23 чужих пункта из 45 в эскалации, две из шести групп были топически
+# грязными, а один настоящий повтор (--workspace/glib) был разорван на два. Ниже —
+# исправленная схема; счёт до/после — в scripts/README.md.
+#
+#   1. Отрицания несделанного отбрасываются ДО разбиения на пункты: значение целиком
+#      вида «нет», «none», «ничего», либо начинающееся с «нет/none/ничего/no» и затем
+#      сразу утверждающее полноту («… — все пункты приёмки выполнены», «…all done»,
+#      см. is_negation()) — не несделанное, а его явное отсутствие. Раньше такой пункт
+#      («нет — все пункты приёмки выполнены…») эскалировался наравне с настоящими
+#      пропусками, потому что склеивался по случайно совпавшему ключу.
+#   2. Каждое оставшееся значение режется на пункты по строкам, начинающимся с маркера
+#      нумерованного/маркированного списка (`\d+[.)]`, `-`, `*`) или по пустой строке;
+#      если ни одного маркера не нашлось, всё значение — один пункт.
+#   3. Каждый пункт нормализуется: нижний регистр, юникод-нормализация NFKD, вырезание
+#      пунктуации, схлопывание цифр вне устойчивых ключей (числа сами по себе, "5"
+#      против "five", не считаются совпадением — осознанный отказ, см. «где ошибается»),
+#      разбиение на слова, выброс стоп-слов.
+#   4. Из пункта извлекаются ДВА РАЗНЫХ по силе сигнала набора, а не один:
+#        - тикет-ключи: токены БУКВЫ-ЦИФРЫ (A-4, FANG-43, …), но ТОЛЬКО если токен не
+#          зажат дефисом в более длинной цепочке — иначе это не номер тикета, а
+#          обрывок имени тома/ветки. «FANG-5» из «fang-target-fang-5-ci» (имя тома) и
+#          из «fix/fang-5-ci» (имя ветки) теперь НЕ считается ключом: слева/справа от
+#          совпадения стоит `-` или `/`, реального разделителя (пробел, запятая, конец
+#          строки) там нет. См. extract_ticket_key() — это фильтр по контексту символа,
+#          не словарь известных тикетов.
+#        - флаги (--workspace, --costly, --stat, …): собираются, но НЕ дают эскалацию
+#          в одиночку. Раньше именно так склеилась группа-спуриоза («ветка не слита» +
+#          «незакоммиченные правки runbook.md») — единственной общей нитью был флаг
+#          `--stat`, встреченный в обоих текстах по совсем разным поводам.
+#   5. Пункты объединяются в компоненты связности, если выполнено любое:
+#        (a) общий тикет-ключ И >= 2 общих значимых слова (ключ один не считается —
+#            см. дефект группы-спуриозы выше; голый факт упоминания одного и того же
+#            FANG-13 в двух не связанных по смыслу пунктах — не повтор);
+#        (b) без общего ключа — Жаккар по значимым словам >= 0.30 И общих слов >= 2
+#            (как раньше; порог не менялся);
+#        (c) общий «тег повода» (см. CAUSE_TAGS ниже) — куратский список синонимов
+#            одного и того же повода, записанного разными словами.
+#      Компонента размера >= 2 РАЗНЫХ прогонов помечается ЭСКАЛАЦИЯ (как раньше).
+#   6. CAUSE_TAGS — механизм синонимии повода (не парсер смысла, список руками):
+#      слова/ключи {--workspace, glib-2, gobject-2, gtk-2, gtk-3, gtk-4} свёрнуты в
+#      один тег: «cargo test --workspace не собирается» и «нет gtk/gobject-2.0 dev
+#      headers» — один и тот же повод (сборочный контейнер без glib/gtk), разными
+#      словами. На данных сессии это подняло повтор с 4 прогонов (одна группа
+#      `[--workspace]`) + отдельно 4 прогона (`[GOBJECT-2]`, 2 из них общие с первой) до
+#      6 РАЗЛИЧНЫХ прогонов одной группой — см. scripts/README.md, счёт воспроизводим
+#      прогоном с --json.
+#      Где CAUSE_TAGS заведомо ошибётся: это список слов, а не причинный граф — любое
+#      упоминание gtk/glib/gobject по СОВСЕМ другому поводу (например, баг конкретно в
+#      GTK-биндинге, не про отсутствие dev-заголовков в сборочном образе) склеится с
+#      этой группой так же охотно. Список короткий и специфичный этой сессии; на новом
+#      корпусе его придётся расширять или сузить руками, автоматически он не растёт.
+#
+#   Где это по-прежнему заведомо ошибается (перешло из версии 1, не чинилось):
+#   - Жаккар по мешку слов слепнет к перефразировкам без общих корней и к отрицанию
+#     («X не работает» vs «X теперь работает») — снимет второе как повтор первого,
+#     если слова пересеклись.
+#   - Тикет-ключи матчатся точно после апкейса: "fang-43" и "FANG 43" (пробел вместо
+#     дефиса) считаются одним ключом, а "FANG43" без разделителя — не считается.
+#   - Фильтр по контексту символа (п.4) режет и часть настоящих упоминаний: тикет,
+#     упомянутый ВНУТРИ имени ветки («fix/fang-9-phantom-write»), тоже перестаёт быть
+#     ключом, хотя ссылается на настоящий FANG-9. Тут нет способа отличить «имя ветки
+#     без реального тикета» от «имя ветки, названной по реальному тикету» одним
+#     синтаксическим правилом — выбран более безопасный (реже ложно клеит) вариант
+#     ценой того, что изредка не заметит настоящий повтор, спрятанный в имени ветки.
+#   - Компонента связности транзитивна: если пункт X похож на Y, а Y — на Z, X и Z
+#     попадут в одну группу, даже если X и Z по отдельности ниже порога.
+#   - Цифры вне устойчивых ключей выброшены нарочно (иначе "5 репро" и "12 репро"
+#     совпали бы как один повод по остальным словам) — ценой того, что реальные
+#     числовые различия («упало 2 из 12» vs «упало 11 из 12») тоже гасятся.
+#
+# ВЫХОД: 0 — свод построен и напечатан. 2 — не нашёл ни одного файла прогона, ни одного
+# файла с полем «несделано»/unfinished, аргументы прогона дали < 2 прогонов (искать
+# повтор не в чем — один прогон не может «повториться»), или ошибка аргументов. Пустой
+# зелёный вывод (0 прогонов, 0 пунктов) нарочно запрещён этим же правилом: каталог с
+# одним прогоном раньше давал «ЭСКАЛАЦИЯ 0» и код выхода 0 — это была тавтология в
+# смысле того же протокола, который просит инструмент существовать; теперь такой
+# каталог — отказ (код 2), а не тихий зелёный «нечего сообщить».
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import unicodedata
+from collections import defaultdict
+
+UNFINISHED_KEYS = {"несделано", "unfinished", "unverified", "not_done"}
+
+STOPWORDS = {
+    "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то", "все",
+    "она", "так", "его", "но", "да", "ты", "к", "у", "же", "вы", "за", "бы", "по",
+    "только", "ее", "мне", "было", "вот", "от", "меня", "еще", "нет", "о", "из", "ему",
+    "теперь", "когда", "даже", "ну", "вдруг", "ли", "если", "уже", "или", "ни", "быть",
+    "был", "него", "до", "вас", "нибудь", "опять", "уж", "вам", "сказал", "ведь", "там",
+    "потом", "себя", "ничего", "ей", "может", "они", "тут", "где", "есть", "надо",
+    "ней", "для", "мы", "тебя", "их", "чем", "была", "сам", "чтоб", "без", "будто",
+    "чего", "раз", "тоже", "себе", "под", "будет", "ж", "тогда", "кто", "этот", "того",
+    "потому", "этого", "какой", "совсем", "ним", "здесь", "этом", "один", "почти",
+    "мой", "тем", "чтобы", "нее", "сейчас", "были", "куда", "зачем", "всех", "никогда",
+    "можно", "при", "наконец", "два", "об", "другой", "хоть", "после", "над", "больше",
+    "тот", "через", "эти", "нас", "про", "всего", "них", "какая", "много", "разве",
+    "три", "эту", "моя", "впрочем", "хорошо", "свою", "этой", "перед", "иногда", "лучше",
+    "чуть", "том", "нельзя", "такой", "им", "более", "всегда", "конечно", "всю", "между",
+    "это", "эта", "которая", "который", "которые", "которого", "которых",
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "to", "of",
+    "and", "or", "in", "on", "at", "for", "with", "that", "this", "it", "as", "by",
+    "not", "no", "did", "does", "do", "has", "have", "had", "but", "so", "than", "then",
+    "stayed", "gate", "behind",
+}
+
+STABLE_KEY_RE = re.compile(r"\b([A-Za-zА-Яа-я]{1,10}-\d+)\b")
+FLAG_RE = re.compile(r"(--[a-z][a-z0-9-]*)")
+ITEM_SPLIT_RE = re.compile(r"(?:^|\n)\s*(?:\d+[.)]|[-*•])\s+")
+PUNCT_TABLE = str.maketrans({c: " " for c in ".,;:!?()[]{}\"'`«»—–\\/|"})
+
+# Отрицание наличия несделанного: значение целиком "нет"/"none"/"ничего", либо
+# начинающееся с одного из этих слов и сразу утверждающее полноту ("все пункты
+# приёмки выполнены", "all done", "nothing left"). Не парсер, короткий список форм,
+# калиброванный на реальном пункте 4.4 сессии ("нет — все пункты приёмки выполнены…").
+NEGATION_WHOLE = {"нет", "none", "no", "n/a", "nothing", "ничего", "null"}
+NEGATION_LEAD_RE = re.compile(
+    r"^(?:нет|none|no|ничего|nothing)\b\s*[-—,:]*\s*"
+    r"(?:все|всё|all|nothing\s+(?:else|more|left)|acceptance|пункт|done|выполнен)",
+    re.IGNORECASE,
+)
+
+# Тег повода: куратский (руками составленный) список синонимов одного и того же
+# повода, записанного разными словами/ключами — см. докстринг выше, п.6, и
+# "где заведомо ошибётся" там же. Каждый набор — токены, КАК ОНИ ХРАНЯТСЯ в normalize()
+# (флаги — нижним регистром, тикет-подобные ключи — верхним).
+CAUSE_TAGS = {
+    "CAUSE:WORKSPACE_GLIB_BUILD_DEP": {
+        "--workspace", "GLIB-2", "GOBJECT-2", "GTK-2", "GTK-3", "GTK-4",
+    },
+}
+_CAUSE_LOOKUP = {member: tag for tag, members in CAUSE_TAGS.items() for member in members}
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def is_negation(item):
+    """True, если пункт утверждает ОТСУТСТВИЕ несделанного, а не сам является им.
+
+    Не путать с «Не гонял X» (это само по себе несделанное, остаётся в списке) —
+    отрицание ловится только по ведущему слову ("нет"/"none"/"ничего"/"no"), а не по
+    частице «не» где угодно в тексте.
+    """
+    s = item.strip()
+    if not s:
+        return True
+    if s.strip(" .!").lower() in NEGATION_WHOLE:
+        return True
+    return bool(NEGATION_LEAD_RE.match(s))
+
+
+def split_items(text):
+    """Режет одно значение «несделано» на отдельные пункты списка."""
+    if text is None:
+        return []
+    if isinstance(text, list):
+        out = []
+        for v in text:
+            out.extend(split_items(v))
+        return out
+    text = str(text).strip()
+    if not text:
+        return []
+    parts = ITEM_SPLIT_RE.split(text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) <= 1:
+        # нет маркеров списка — пробуем разбить по пустым строкам, иначе один пункт
+        parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    parts = parts if parts else [text]
+    return [p for p in parts if not is_negation(p)]
+
+
+def extract_ticket_keys(item):
+    """Тикет-ключи (БУКВЫ-ЦИФРЫ), отфильтрованные по контексту символа.
+
+    Совпадение принимается, только если оно НЕ зажато дефисом с любой стороны —
+    иначе это обрывок более длинного имени тома/ветки ("fang-target-fang-5-ci",
+    "fix/fang-5-ci"), а не номер тикета. См. докстринг файла, п.4, и оговорку в
+    «где заведомо ошибётся»: настоящий тикет, упомянутый ВНУТРИ имени ветки
+    ("fix/fang-9-phantom-write"), тем же правилом тоже отсеивается — ложноотрицательно,
+    но безопаснее, чем ложноположительно клеить по имени тома.
+    """
+    keys = set()
+    for m in STABLE_KEY_RE.finditer(item):
+        start, end = m.span()
+        before = item[start - 1] if start > 0 else ""
+        after = item[end] if end < len(item) else ""
+        if before == "-" or after == "-":
+            continue
+        keys.add(m.group(1).upper())
+    return keys
+
+
+def normalize(item):
+    """Возвращает (слова, тикет_ключи, флаги, теги_повода) — см. докстринг файла."""
+    tickets = extract_ticket_keys(item)
+    flags = {f.lower() for f in FLAG_RE.findall(item)}
+    cause_tags = {_CAUSE_LOOKUP[k] for k in (tickets | flags) if k in _CAUSE_LOOKUP}
+
+    s = unicodedata.normalize("NFKD", item).lower()
+    s = STABLE_KEY_RE.sub(" ", s)  # ключи учтены отдельно, не мешаем словам
+    s = FLAG_RE.sub(" ", s)
+    s = s.translate(PUNCT_TABLE)
+    s = re.sub(r"\d+", " ", s)  # цифры вне устойчивых ключей не участвуют в сравнении
+    words = {w for w in s.split() if len(w) > 2 and w not in STOPWORDS}
+    return words, tickets, flags, cause_tags
+
+
+def jaccard(a, b):
+    if not a and not b:
+        return 0.0
+    u = a | b
+    if not u:
+        return 0.0
+    return len(a & b) / len(u)
+
+
+def should_union(ri, rj):
+    """Критерий одного повода — несколько признаков, ни один ОДИНОЧНЫЙ ключ не клеит.
+
+    (c) тег повода общий — куратская синонимия, единственный сигнал, которому
+        разрешено клеить в одиночку (это и есть весь смысл CAUSE_TAGS).
+    (a) >= 2 ОБЩИХ тикет-ключей — упоминание одного и того же номера в двух текстах
+        по разным поводам (FANG-13 у обоих, но не о том же самом) было главным
+        источником группы-спуриозы (23 из 45 в разборе), поэтому один общий ключ
+        сам по себе больше не клеит. Два и более общих ключа — гораздо более редкое
+        совпадение (набор «A-4, A-6, A-7, FANG-43, FANG-45» целиком повторяется
+        ровно тогда, когда речь о тех же пяти дорогих репро) и НЕ требует общих слов:
+        русско- и англоязычные формулировки одного и того же пункта («Costly repros
+        … stayed behind the --costly gate» / «Пять репро … не запускались») не делят
+        ни одного словарного корня, только список ключей — Жаккар по словам их бы не
+        склеил никогда, а >= 2 общих ключа склеивают верно.
+    (a') ровно 1 общий тикет-ключ — тоже сигнал, но слабый, требует подтверждения:
+        >= 2 общих значимых слова.
+    (b) без общего ключа — Жаккар >= 0.30 И общих слов >= 2 (как в версии 1).
+    """
+    if ri["cause_tags"] & rj["cause_tags"]:
+        return True
+    shared_tickets = ri["tickets"] & rj["tickets"]
+    if len(shared_tickets) >= 2:
+        return True
+    common_words = ri["words"] & rj["words"]
+    if len(shared_tickets) == 1 and len(common_words) >= 2:
+        return True
+    if len(common_words) >= 2 and jaccard(ri["words"], rj["words"]) >= 0.30:
+        return True
+    return False
+
+
+def group_items(records):
+    """records: список dict{run, date, text, words, tickets, flags, cause_tags}."""
+    n = len(records)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if should_union(records[i], records[j]):
+                union(i, j)
+
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(records[i])
+    return list(groups.values())
+
+
+def load_runs(directory, since):
+    files = sorted(glob.glob(os.path.join(directory, "wf_*.json")))
+    runs = []
+    for f in files:
+        try:
+            with open(f, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            eprint(f"ofledger: пропускаю {f}: {e}")
+            continue
+        ts = d.get("timestamp", "")
+        if since and ts and ts < since:
+            continue
+        runs.append((f, d))
+    return runs
+
+
+def collect_unfinished(run_id, date, result, out):
+    """Рекурсивно обходит result, собирая (run, date, участок, ключ, текст)."""
+    def walk(node, label):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k in UNFINISHED_KEYS:
+                    for item in split_items(v):
+                        out.append({"run": run_id, "date": date, "участок": label, "поле": k, "text": item})
+                elif isinstance(v, (dict, list)):
+                    next_label = label
+                    if k in ("участок", "label") and isinstance(v, str):
+                        pass
+                    walk(v, label)
+            # если у самого node есть поле-метка "участок"/"label", используем его
+            # для дочерних вызовов через локальную переменную выше — уже сделано неявно
+        elif isinstance(node, list):
+            for item in node:
+                sub_label = label
+                if isinstance(item, dict):
+                    sub_label = item.get("участок") or item.get("label") or label
+                walk(item, sub_label)
+
+    walk(result, None)
+
+
+def collect_agents(runs):
+    agents = []
+    for run_id, d in runs:
+        for item in d.get("workflowProgress") or []:
+            if item.get("type") != "workflow_agent":
+                continue
+            agents.append({
+                "run": run_id,
+                "label": item.get("label"),
+                "model": item.get("model"),
+                "state": item.get("state"),
+                "attempt": item.get("attempt"),
+                "tokens": item.get("tokens") or 0,
+                "toolCalls": item.get("toolCalls") or 0,
+                "durationMs": item.get("durationMs") or 0,
+                "error": item.get("error"),
+            })
+    return agents
+
+
+def build_report(directory, since):
+    runs = load_runs(directory, since)
+    if not runs:
+        return None, f"ofledger: не нашёл ни одного файла wf_*.json в {directory}" + (f" с {since}" if since else "")
+    if len(runs) < 2:
+        return None, (
+            f"ofledger: прочитан {len(runs)} прогон в {directory} — искать ПОВТОР не в чем "
+            f"(нужно >= 2 прогонов). Пустой зелёный вывод «эскалация 0» на одном прогоне "
+            f"запрещён нарочно, см. докстринг файла."
+        )
+
+    unfinished_records = []
+    for run_id, d in runs:
+        date = (d.get("timestamp") or "")[:10]
+        collect_unfinished(run_id, date, d.get("result"), unfinished_records)
+
+    if not unfinished_records:
+        return None, (
+            f"ofledger: {len(runs)} файлов прогонов прочитано, но ни в одном нет поля "
+            f"«несделано»/unfinished/unverified/not_done — сводить нечего"
+        )
+
+    for rec in unfinished_records:
+        words, tickets, flags, cause_tags = normalize(rec["text"])
+        rec["words"] = words
+        rec["tickets"] = tickets
+        rec["flags"] = flags
+        rec["cause_tags"] = cause_tags
+
+    groups = group_items(unfinished_records)
+
+    def group_sort_key(g):
+        n_runs = len({r["run"] for r in g})
+        return (-n_runs, -len(g))
+
+    groups.sort(key=group_sort_key)
+
+    group_reports = []
+    for g in groups:
+        distinct_runs = sorted({r["run"] for r in g})
+        stable_keys = sorted(set().union(*[r["tickets"] | r["flags"] | r["cause_tags"] for r in g])) if g else []
+        group_reports.append({
+            "escalate": len(distinct_runs) >= 2,
+            "run_count": len(distinct_runs),
+            "item_count": len(g),
+            "stable_keys": stable_keys,
+            "representative": min(g, key=lambda r: len(r["text"]))["text"],
+            "items": [{"run": r["run"], "date": r["date"], "участок": r["участок"], "text": r["text"]} for r in g],
+        })
+
+    agents = collect_agents(runs)
+    n_agents = len(agents)
+    n_error = sum(1 for a in agents if a["state"] == "error")
+    n_done = sum(1 for a in agents if a["state"] == "done")
+    n_incomplete = sum(1 for a in agents if a["state"] in ("start", "progress"))
+    n_retried = sum(1 for a in agents if (a["attempt"] or 1) > 1)
+    errors_no_retry = [a for a in agents if a["state"] == "error" and (a["attempt"] or 1) == 1]
+
+    models = defaultdict(lambda: {"count": 0, "tokens": 0, "toolCalls": 0, "durationMs": 0})
+    for a in agents:
+        m = models[a["model"] or "?"]
+        m["count"] += 1
+        m["tokens"] += a["tokens"]
+        m["toolCalls"] += a["toolCalls"]
+        m["durationMs"] += a["durationMs"]
+
+    total_tokens = sum(d.get("totalTokens") or 0 for _, d in runs)
+    total_tool_calls = sum(d.get("totalToolCalls") or 0 for _, d in runs)
+    total_duration_ms = sum(d.get("durationMs") or 0 for _, d in runs)
+
+    error_reasons = defaultdict(int)
+    for a in agents:
+        if a["state"] == "error" and a["error"]:
+            key = a["error"].strip().splitlines()[0][:120]
+            error_reasons[key] += 1
+
+    report = {
+        "runs_scanned": len(runs),
+        "run_ids": [r for r, _ in runs],
+        "escalations": [g for g in group_reports if g["escalate"]],
+        "single_mentions": [g for g in group_reports if not g["escalate"]],
+        "agents": {
+            "total": n_agents,
+            "done": n_done,
+            "error": n_error,
+            "incomplete_stuck": n_incomplete,
+            "retried_attempt_gt_1": n_retried,
+            "errors_without_retry_lost_work": [
+                {"run": a["run"], "label": a["label"], "error": (a["error"] or "")[:200]}
+                for a in errors_no_retry
+            ],
+            "by_model": {k: v for k, v in models.items()},
+            "error_reasons": dict(error_reasons),
+        },
+        "totals": {
+            "tokens": total_tokens,
+            "toolCalls": total_tool_calls,
+            "durationMs": total_duration_ms,
+        },
+    }
+    return report, None
+
+
+def render_text(report):
+    lines = []
+    lines.append(f"ofledger — прогонов прочитано: {report['runs_scanned']}")
+    lines.append("")
+    lines.append(f"=== ЭСКАЛАЦИЯ (повторено в >= 2 прогонах): {len(report['escalations'])} ===")
+    if not report["escalations"]:
+        lines.append("  (нет)")
+    for g in report["escalations"]:
+        keys = f" [{', '.join(g['stable_keys'])}]" if g["stable_keys"] else ""
+        lines.append(f"\n  * {g['run_count']} прогонов, {g['item_count']} упоминаний{keys}")
+        lines.append(f"    представитель: {g['representative'][:200]}")
+        for it in g["items"]:
+            uch = f" ({it['участок']})" if it["участок"] else ""
+            lines.append(f"      - {it['run']} {it['date']}{uch}: {it['text'][:160]}")
+
+    lines.append("")
+    lines.append(f"=== единичные упоминания (1 прогон): {len(report['single_mentions'])} ===")
+    for g in report["single_mentions"]:
+        it = g["items"][0]
+        uch = f" ({it['участок']})" if it["участок"] else ""
+        lines.append(f"  - {it['run']} {it['date']}{uch}: {it['text'][:160]}")
+
+    ag = report["agents"]
+    lines.append("")
+    lines.append("=== агенты ===")
+    lines.append(
+        f"  всего={ag['total']} done={ag['done']} error={ag['error']} "
+        f"застряли(start/progress)={ag['incomplete_stuck']} повторных_попыток={ag['retried_attempt_gt_1']}"
+    )
+    if ag["errors_without_retry_lost_work"]:
+        lines.append(f"  ОТКАЗЫ БЕЗ ПОВТОРА (работа потеряна целиком): {len(ag['errors_without_retry_lost_work'])}")
+        for e in ag["errors_without_retry_lost_work"]:
+            lines.append(f"    - {e['run']} [{e['label']}]: {e['error'][:150]}")
+    if ag["error_reasons"]:
+        lines.append("  причины ошибок:")
+        for reason, cnt in sorted(ag["error_reasons"].items(), key=lambda kv: -kv[1]):
+            lines.append(f"    {cnt}x  {reason}")
+    lines.append("  по моделям:")
+    for model, v in sorted(ag["by_model"].items(), key=lambda kv: -kv[1]["count"]):
+        lines.append(f"    {model}: агентов={v['count']} токенов={v['tokens']} вызовов_инструментов={v['toolCalls']}")
+
+    t = report["totals"]
+    lines.append("")
+    lines.append(f"=== итого по прогонам === токенов={t['tokens']} вызовов_инструментов={t['toolCalls']} времени_мс={t['durationMs']}")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ofledger", add_help=True)
+    ap.add_argument(
+        "--dir", required=True,
+        help="путь к workflows/ конкретной сессии, "
+             "напр. ~/.claude/projects/-root/<session-id>/workflows",
+    )
+    ap.add_argument("--since", default=None, help="YYYY-MM-DD")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    if not os.path.isdir(args.dir):
+        eprint(f"ofledger: нет каталога: {args.dir}")
+        return 2
+
+    report, err = build_report(args.dir, args.since)
+    if err:
+        eprint(err)
+        return 2
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(render_text(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

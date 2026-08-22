@@ -1,11 +1,14 @@
 # Bundled scripts
 
-Eight scripts: `ofctl`, `ofdoctor`, `ofhand`, `ofcron`, `ofbackup` run on the host and
+Eleven scripts. `ofctl`, `ofdoctor`, `ofhand`, `ofcron`, `ofbackup` run on the host and
 talk to the running daemon; `ytwatch.py` and `rtwatch.py` run *inside* the container as
 flat-argv helpers (`shell_exec` rejects pipes/redirection, so intake logic has to live in
 a script file, not a prompt); `ofcheck-rs` runs on the host but talks to neither — it
 drives a throwaway `rust:1-slim-bookworm` container to `cargo check` a worktree, so
-patches can be checked without installing Rust on the host. Everything is POSIX `sh` or
+patches can be checked without installing Rust on the host — but see the warning in its
+section: **its exit code is always 0**, so it cannot be used as proof. `ofgate` is the
+tool that can. `ofmutate` proves a test would go red without its patch, and `ofledger`
+reads the workflow journals. Everything is POSIX `sh` or
 python3 stdlib, so they have no dependency beyond what is already on the host, and
 nothing to install in the container (which has no `curl`). Each of the five API tools and
 `ofcheck-rs` takes `--help`.
@@ -116,6 +119,12 @@ backup. Triggers and workflow runs never persisted and do not come back.
 
 ## `ofcheck-rs` — `cargo check` a worktree without installing Rust on the host
 
+> **Its exit code is always 0 — it cannot report failure.** The last line of the script
+> is `cargo check $ARGS 2>&1 | tail -40`, and a pipeline's status is the status of its
+> last command. Measured: `docker run --rm alpine sh -c "false | tail -40"; echo $?` → `0`.
+> Read its *output*, never its code, and never cite it as evidence a patch builds —
+> use `ofgate` for that.
+
     ofcheck-rs /root/src/openfang-worktrees/patch-123
     ofcheck-rs /root/src/openfang-worktrees/patch-123 openfang-kernel openfang-api
 
@@ -138,6 +147,41 @@ again looks like a patch defect. `ofcheck-rs` refuses to start with **less than 
 free on `/` (exit 3, with a hint to `docker volume rm fang-target-<slug>` for merged
 patches) and prints a warning under 25 GB. There is no automatic cleanup — delete the
 volumes for merged/abandoned worktrees by hand.
+
+## `ofmutate` — proves a test would go red without the patch
+
+    ofmutate /root/src/wt/<branch> --test file_read -p openfang-runtime
+    ofmutate <worktree> --test <filter> -p <crate> --dry-run     # hunk inventory only
+    ofmutate <worktree> --test <filter> -p <crate> --per-hunk     # which hunks the test ignores
+
+Mechanical red-before-green, checked after the fact: it runs the filtered test as
+committed (must be **green and non-empty**), reverse-applies the patch's
+*production* hunks while leaving its *test* hunks in place (must go **red**), then
+restores the tree. Rust keeps unit tests in the same file under `#[cfg(test)]`, so
+reverting whole files would delete the test along with the fix and prove nothing —
+hence hunk-level splitting, by whether a hunk's new line range falls inside a
+`#[cfg(test)]` module.
+
+Verdicts, and why the distinction matters:
+
+| Verdict | Exit | Meaning |
+|---|---|---|
+| `ДОКАЗАНО (RED-ASSERT)` | 0 | Test compiled without the patch and failed an assertion. Real proof. |
+| `СЛАБОЕ КРАСНОЕ (RED-COMPILE)` | 0 | Without the patch the test does not compile. Proves only that it *knows* the new API, not that it checks its behaviour — such a test could call the new function and assert nothing. Needs `--per-hunk` or a second test. |
+| `ТАВТОЛОГИЯ` | 1 | Test passes without the patch too. |
+| `passed=0` refusal | 4 | The filter matched no test. A green empty run is the purest form of tautology: `cargo test <typo>` prints `test result: ok. 0 passed` and exits 0. |
+
+It refuses to run on a dirty worktree (exit 2) — the revert would overwrite
+uncommitted work — and refuses below 12 GB free (exit 3, same threshold as
+`ofcheck-rs`). **Exit 3 is the tool declining, not a defect in your patch**; that
+misreading cost two debugging rounds over the fork sprints. Override the threshold
+only to exercise that branch: `OFMUTATE_DISK_MIN_G=999 ofmutate …`.
+
+Runs in the same container and on the same `fang-target-<slug>` build volume as
+`ofcheck-rs`, deliberately reproducing that script's volume name character for
+character (including the trailing `-` that `tr` leaves from `basename`'s newline),
+so builds stay incremental and no extra disk is consumed. Measured on
+`crates/openfang-runtime`: 203 s cold for the first run, 35 s for the second.
 
 ## `ytwatch.py` — YouTube intake, runs *inside* the container
 
@@ -166,3 +210,409 @@ subtitles are `srt`, not `json3`, and live under `subtitles` rather than
 `automatic_captions`, so fetching needs `--write-subs`, not `--write-auto-subs`; and video
 ids are 32-char hex instead of YouTube's 11-char base64 form. Install the same way as
 `ytwatch.py` — `mkdir -p` the workspace `bin/` first, then `docker cp`.
+
+---
+## `ofgate` — the one command that decides "done"
+
+    ofgate <worktree>                        # full gate, 9-minute self-deadline
+    ofgate <worktree> --wait                 # same, 4-hour budget, for Bash run_in_background
+    ofgate <worktree> --only fmt
+    ofgate <worktree> --only fmt,clippy --wait
+
+Runs exactly what `.github/workflows/fork-ci.yml` runs, in the CI's order, with the
+command lines copied out of that file rather than from memory:
+
+| step | command |
+|---|---|
+| `fmt` | `cargo fmt --all -- --check` |
+| `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` |
+| `test` | `cargo test --workspace -- --test-threads=2` |
+
+The `-- --test-threads=2` on the test step is in the workflow (it bounds peak memory on
+GitHub runners), so it is here too. Like CI, `ofgate` stops at the first red step.
+
+Exit codes: `0` every requested check green · `1` at least one red · `2` bad arguments ·
+`3` the tool declining · `4` the run did not fit `ofgate`'s own deadline. **`3` and `4`
+are the tool, not a defect in the tree** — reading a tool refusal as a bad patch has
+happened here twice. Override the disk arithmetic only to exercise that branch:
+
+    $ OFGATE_DISK_MIN_G=999 ofgate /root/ofgfix-plainname --only fmt
+    ofgate: свободно 31G, этому прогону нужно 999G.
+      ...
+      это ОТКАЗ ИНСТРУМЕНТА, а не дефект проверяемого дерева.
+    $ echo $?
+    3
+
+A non-numeric override is refused rather than ignored. Before this was fixed a typo
+disabled the disk gate outright — `[: Illegal number: lots`, `[` returns 2, `if` reads
+that as "there is enough room", exit 0. Measured, both versions:
+
+    $ OFGATE_DISK_MIN_G=lots ofgate /root/ofgfix-plainname --only fmt   # old
+    /root/.claude/skills/openfang/scripts/ofgate: 181: [: Illegal number: lots
+    result     : GREEN — все запрошенные проверки прошли
+    $ echo $?
+    0
+
+    $ OFGATE_DISK_MIN_G=lots ofgate /root/ofgfix-plainname --only fmt   # now
+    ofgate: OFGATE_DISK_MIN_G должно быть целым неотрицательным числом, а получено 'lots'
+    $ echo $?
+    2
+
+This is the same class as `ofcheck-rs`'s `tail`: a comparison that fails is read as a
+comparison that passed. Every number that reaches a comparison in `ofgate` is checked
+first, and an unparseable one is a refusal.
+
+### Why this exists next to `ofcheck-rs`, which is not going away
+
+**`ofcheck-rs` cannot report a failure — it is broken by exit code.** Its last line is
+
+    cargo check $ARGS 2>&1 | tail -40
+
+and a pipeline's status is the status of its *last* command, here `tail`, which always
+succeeds. Measured, not read off the source:
+
+    $ docker run --rm alpine sh -c "false | tail -40"; echo $?
+    0
+
+No call to `ofcheck-rs`, past or future, can return non-zero, and `tail -40` truncates
+the error list on top of that. `ofgate` has no pipelines — each step is its own
+container, whose exit code comes from `docker wait` and is then checked for *being a
+number at all* before it is compared — and the complete output goes to a file, with only
+a summary and the path on stdout.
+
+Two more gaps it closes:
+
+* **No script on this box ran `cargo fmt --check`** before `ofgate`.
+  `grep -rl 'cargo fmt' /root/.claude/skills /root/src/openfang --exclude-dir=.git`
+  returns **14** files as of 2026-08-21 (an earlier revision of this file said nine —
+  that count had gone stale). Exactly two of them are executable, and only one runs the
+  check: `ofgate` itself, and `docs/subagent-report.schema.check.py`, which merely
+  mentions the string. The other twelve are documents, the two workflow files, agent
+  templates, and one hand-written record of a single ad-hoc run
+  (`tests/fang/after-v6/build-checks.txt`).
+* **`ofcheck-rs`'s `--workspace` branch cannot work.** It substitutes `--workspace` when
+  handed no crate list, but its `rust:1-slim-bookworm` + `pkg-config libssl-dev perl
+  make` image cannot build `openfang-desktop`: that is step 1 of the image bisection
+  below, and the same wall is recorded independently in
+  `/root/src/openfang/tests/fang/after-v6/build-checks.txt` ("`cargo test --workspace`
+  does not build on this box because a GUI crate wants glib-2.0 dev headers the builder
+  image does not carry"). With `ofgate`'s image the whole workspace builds, so
+  `--workspace` is the normal mode and not a dead branch.
+
+### The build image
+
+`scripts/ofgate-image/Dockerfile`, tagged `ofgate-build:1.91`. `ofgate` builds it on
+first use and reuses it, instead of `apt-get install`-ing into a throwaway container on
+every call the way `ofcheck-rs` does.
+
+Its contents were established by running the build and reading what broke:
+
+1. `rust:1.91-slim-bookworm` plus what `ofcheck-rs` installs (`pkg-config libssl-dev
+   perl make`) → `cargo check -p openfang-desktop` dies in `glib-sys`:
+   `The system library glib-2.0 required by crate glib-sys was not found.`
+2. adding `libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+   patchelf` → the same command finishes `exit=0`, 5m43s from cold.
+
+So **`--workspace --exclude openfang-desktop` is not needed** — the exclusion turned out
+to be five apt packages.
+
+The toolchain is installed under the name the fork asks for. `rust-toolchain.toml` says
+`channel = "1.91"`; `rust:1.91-slim-bookworm` ships the toolchain named
+`1.91.1-x86_64-unknown-linux-gnu`, which is a different name to `rustup`, so it
+re-downloaded the whole toolchain on every run. Same green `--only fmt` run, before and
+after baking `rustup toolchain install 1.91` into the image: **19s → 4s**, and the log
+went from 511 B of `info: downloading component …` to 0 B.
+
+### `/build` is writable, and the tree is still never touched
+
+The tree is mounted read-only at `/src`; `/build` is a tmpfs into which each step does
+`cp -a /src/. /build/` before running cargo.
+
+The first version mounted the worktree straight onto `/build` with `:ro`, and that broke
+the thing the gate exists for. Cargo rewrites `Cargo.lock` whenever a patch adds a
+dependency, and on a read-only mount that produced
+
+    error: failed to write /build/Cargo.lock
+    Caused by: Read-only file system (os error 30)
+    --- clippy : RED  exit=101
+    exit 1
+
+— a **tool failure printed as a red patch**, on code Fork CI (which checks out writable)
+would have passed. Reproduced on a canary and then re-run after the fix:
+
+    $ ofgate /root/ofgfix-deptest --only clippy --wait     # before
+    --- clippy : RED  exit=101  1s
+          | error: failed to write /build/Cargo.lock
+          | Read-only file system (os error 30)
+    $ echo $?
+    1
+
+    $ ofgate /root/ofgfix-deptest --only clippy --wait     # after
+    --- clippy : GREEN  exit=0  1s
+    note       : cargo переписал Cargo.lock (дерево не изменено; как вышло — …/Cargo.lock.after)
+    $ echo $?
+    0
+    $ wc -c /root/ofgfix-deptest/Cargo.lock                # user's tree, unchanged
+    0 /root/ofgfix-deptest/Cargo.lock
+
+The copy costs 1.2 s on `/root/src/openfang` (35 MB including `.git`) and does **not**
+cost a rebuild: the path stays `/build` and `cp -a` preserves mtimes, so cargo's
+fingerprints stay valid. Measured on a canary with a dependency, two consecutive runs —
+the second log reads `Finished dev profile … in 0.09s`, with no `Checking` line. The
+`Cargo.lock` cargo produced is lifted out of the tmpfs into the log directory as
+`Cargo.lock.after`, and a `note :` line in the verdict says so. If a step ever does fail
+on a read-only write anyway, that is reported as `TOOLFAIL` and exit **3**, not as a red
+check.
+
+### Build target isolation, and who owns a build volume
+
+The disease is described in `ofcheck-rs`'s own header: one shared `CARGO_TARGET_DIR`
+across worktrees returned another tree's result *silently*, because cargo fingerprints
+key on path and mtime while every tree is mounted at the same path.
+
+Naming the volume after the worktree's `basename` alone does **not** cure it, and the
+first version of `ofgate` did exactly that. Two different trees whose directories share a
+name share a volume. Measured on two canaries, `/root/ofgfix-twinA/twin` and
+`/root/ofgfix-twinB/twin`, the second containing `let pi = 3.14159265358979;`
+(`clippy::approx_constant`), which in isolation is `exit=101`:
+
+    # old ofgate
+    twinA: target-vol : fang-target-twin-   --- clippy : GREEN  exit=0
+    twinB: target-vol : fang-target-twin-   --- clippy : GREEN  exit=0     ← false green
+
+    # now
+    twinA: target-vol : fang-target-twin-
+           --- clippy : GREEN  exit=0
+    twinB: target-vol : fang-target-twin-1dd290d414e4  (fang-target-twin- принадлежит /root/ofgfix-twinA/twin)
+           --- clippy : RED  exit=101   error: approximate value of `f{32,64}::consts::PI` found
+           exit 1
+
+Ownership is recorded *inside* the volume, in `.ofgate-owner`, which holds the real path
+of the tree that claimed it:
+
+* volume absent → create it, write the marker;
+* marker matches → it is ours, build incrementally;
+* marker names another tree → use `fang-target-<slug><hash-of-path>` instead;
+* **no marker** (a volume from the old naming scheme) → do not adopt it silently. The
+  default is to move to the path-hashed volume and rebuild from cold. Adopting the old
+  volume is possible but must be explicit, `OFGATE_ADOPT_LEGACY_VOL=1`, and only by
+  someone who knows which tree filled it. This is what preserves the warm 25 GB
+  `fang-target-openfang-` across the change instead of stranding it.
+
+The disk guard is measured arithmetic rather than `ofcheck-rs`'s flat 12 GB: a full green
+`fmt+clippy+test` target for this fork is 22 GB, so a long mode demands only what its own
+volume still lacks of those 22, and an incremental run on an already-filled volume
+legitimately proceeds on a nearly full disk.
+
+Those figures are read out of `du` and `df` **by first field**. The first version piped
+the whole `du` line through `tr -dc '0-9'` and so swallowed the digits in the *path*:
+
+    $ du -sBG /var/lib/docker/volumes/fang-target-ofgfix-2026-08-21-/_data
+    1G	/var/lib/docker/volumes/fang-target-ofgfix-2026-08-21-/_data
+    $ ... | tr -dc '0-9'          # old
+    120260821
+    $ ... | awk 'NR==1{gsub(/[^0-9]/,"",$1);print $1+0}'   # now
+    1
+
+With the old parse, `NEED_G = 22 - 120260821` went negative, clamped to the 2 GB
+headroom, and the disk gate was off for any directory with a digit in its name. Two
+byte-identical trees differing only in directory name, with the constant scaled so the
+threshold is crossable on today's 31 GB disk:
+
+    old:  /root/ofgfix-plainname → EXIT=3     /root/ofgfix-2026-08-21 → GREEN, EXIT=0
+    now:  /root/ofgfix-plainname → EXIT=3     /root/ofgfix-2026-08-21 → EXIT=3
+
+### The ten-minute ceiling: `ofgate` watches its own clock
+
+The Bash tool's `timeout` ceiling is 600000 ms; a larger request is silently truncated to
+ten minutes and returns `Command timed out after 10m 0s` while the command keeps running.
+
+The first version "refused" to run long modes in the foreground — but it never
+determined whether it *was* in the foreground. It looked only at the `--wait` flag, so
+the refusal was bypassed by an argument and was therefore not a refusal. It is now a
+budget that `ofgate` enforces against itself:
+
+* no `--wait` → deadline **540 s**, comfortably inside the ceiling;
+* `--wait` → deadline **14400 s**, the value for a `run_in_background` job;
+* `OFGATE_DEADLINE_S` overrides both.
+
+When the budget runs out `ofgate` kills the container, frees the volume, prints a partial
+verdict with `result : TIMEOUT`, and exits **4** with the background command to use.
+Measured with the budget dialled down to 25 s against a canary whose `build.rs` sleeps
+3000 s:
+
+    $ OFGATE_DEADLINE_S=25 ofgate /root/ofgfix-hang --only clippy
+    deadline   : 25s (--wait=0); по исчерпании — контейнер убит, exit 4
+    --- clippy : TIMEOUT  не уложился в дедлайн 25s  (26s)
+    result     : TIMEOUT — прогон не уложился в 25s на шаге clippy; контейнер убит
+    $ echo $?      # wall clock 28 s
+    4
+    $ docker ps -a --filter ancestor=ofgate-build:1.91 -q | wc -l
+    0
+
+So an agent that forgets `--wait` gets a clean code 4 at nine minutes instead of a silent
+truncation at ten. Nothing decides "long" by guessing any more: the old
+`/target/.ofgate-clippy-warm` stamp is gone, along with the hole where a stamp left by
+*any* green clippy legalised a foreground `fmt,clippy` no matter how much the patch had
+invalidated.
+
+### An interrupted run leaves nothing behind
+
+Each step runs detached, its id is held in a variable, and a `trap` on `EXIT INT TERM
+HUP` removes it. Before this, an interrupted run left the container **alive** — `--rm`
+never fires — still holding the build-target volume and the shared registry volume:
+
+    $ timeout 100 ofgate /root/ofgfix-hang --only clippy --wait     # old
+    $ docker ps --filter ancestor=ofgate-build:1.91
+    f8a312973670   Up 43 seconds   "sh -c 'cargo clippy…"
+    $ docker inspect f8a312973670 --format '{{range .Mounts}}{{.Name}} {{end}}'
+    fang-target-ofgfix-hang- fang-cargo-registry
+
+The first attempt at the trap **did not work**, and the canary is why it was caught:
+`dash` defers a signal handler until the current foreground command finishes, so a trap
+written above a blocking `timeout N docker wait $CID` never runs. `timeout 40 sh ofgate
+…` left `ofgate` alive at second 621 with its container. The wait is therefore a
+background child collected with `wait`, which *is* interruptible:
+
+    $ timeout 30 ofgate /root/ofgfix-hang --only clippy --wait ; echo $?   # now
+    124
+    $ ps -eo pid,cmd | grep -E 'ofgate|docker wait' | grep -v grep
+    (none)
+    $ docker ps -a --filter ancestor=ofgate-build:1.91 -q | wc -l
+    0
+
+`kill -INT` on a running `ofgate` behaves the same: exit 130, zero containers left.
+
+### Measured on this box, this revision
+
+`/root/src/openfang` at `81057f9`, clean tree, **warm** `fang-target-openfang-` volume
+adopted with `OFGATE_ADOPT_LEGACY_VOL=1`, shared cargo registry:
+
+| mode | time |
+|---|---|
+| full `fmt,clippy,test`, warm volume | **81 s** (fmt 4 · clippy 3 · test 74), `result : GREEN`, exit 0 |
+| `--only fmt` on a full copy of the fork | 3 s |
+| the `cp -a /src/. /build/` prologue alone, 35 MB tree incl. `.git` | 1.2 s |
+
+The warm volume was measured at 146 s for the same full run under the previous revision,
+so moving `/build` to a tmpfs copy did **not** cost the incremental build — the artifacts
+in the volume were still valid after the copy. Cold-volume timings for this revision have
+not been re-measured; the figures on record (fmt 3 s · clippy 433 s · test 812–1175 s,
+whole run 1248–1615 s) are the previous revision's and a cold full run needs 22 GB the
+disk does not currently have free.
+
+### The verdict block, and what it is not
+
+Every run prints a fixed-shape block meant to be pasted into a report verbatim:
+
+    === OFGATE VERDICT ===
+    worktree   : /root/src/openfang
+    commit     : <sha> (dirty=no)
+    binding    : коммит <sha> · дерево чистое · tree-sha256:<h> (N файлов)
+    image      : ofgate-build:1.91 sha256:…
+    toolchain  : rust-toolchain.toml=1.91 · в образе: rustc 1.91.1 (ed61e7d7e 2025-11-07)
+    target-vol : fang-target-openfang-
+    checks     : fmt,clippy,test  (порядок CI, останов на первой красной)
+    started    : …
+    deadline   : 14400s (--wait=1); по исчерпании — контейнер убит, exit 4
+    logs       : /var/tmp/ofgate/openfang-/<run-id>
+    --- fmt : GREEN  exit=0  Ns
+          cmd : cargo fmt --all -- --check
+          log : …/fmt.log  (0 B, sha256:e3b0c44298fc1c14)
+    …
+    result     : GREEN — все запрошенные проверки прошли
+    elapsed    : Ns
+    exit       : 0
+    === END OFGATE VERDICT run=<run-id> body-sha256=<h> ===
+
+**The block is not tamper-proof and cannot be, in this scheme.** The closing line is the
+`sha256` of the very body printed above it; the step lines are `sha256`s of files the
+same process wrote; there is no key —
+`grep -n 'hmac\|secret\|OFGATE_KEY\|openssl' ofgate` returns nothing. A complete,
+self-consistent GREEN block is assembled by hand with one `sha256sum` call and no cargo
+container is started; that was measured, not assumed. Earlier revisions of this file
+claimed "retelling it is detectable" — that claim was false and has been removed.
+
+What the block actually gives, and only this:
+
+* a fixed-width machine-readable shape that can be parsed;
+* a pointer to logs that stay on disk under `logs:`, so they can be read and re-hashed;
+* a `binding` line tying the result to tree *content* and to the toolchain image.
+
+The `binding` line exists because a non-git tree and a dirty tree both used to produce a
+plain `result : GREEN` bound to nothing at all — `commit : не git-дерево (dirty=?)`
+went into reports as evidence. Now every run hashes the tree (tracked plus untracked
+non-ignored files under git; everything outside `.git/` and `target/` otherwise) and says
+plainly when the result is *not* bound to a commit:
+
+    commit     : 1aa58ee0225b5cea906bdd6cff4c1f371d6fffb0 (dirty=no)
+    binding    : коммит 1aa58ee… · дерево чистое · tree-sha256:736a43bc20540a72d8dafbf2051e38d7 (2 файлов)
+
+    commit     : 1aa58ee0225b5cea906bdd6cff4c1f371d6fffb0 (dirty=yes)      ← same commit
+    binding    : НЕ привязано к коммиту: дерево грязное (HEAD 1aa58ee…) · tree-sha256:440c1c2db63b7c2e139e5107a00f9cae (2 файлов)
+
+That is a binding, not a signature: it does not stop forgery, it just means the same
+block quoted against a different tree is identifiable as a different tree. **A verdict
+block is evidence only after the reader re-runs the gate.** `ofverify` exists for that;
+`ofgate` does not certify itself.
+
+### Proof that it can go red
+
+The predecessor is broken precisely because nobody ran it against a known-bad tree, so
+every check here has been run against one. These are runs of *this* revision, on
+canaries built for it — a green run on a clean tree proves nothing on its own, since a
+tool that always exits 0 produces one too:
+
+| canary | what is wrong with it | result |
+|---|---|---|
+| `/root/ofgfix-forkcopy` — a full copy of the fork (711 files) | `pub fn ofgfix_fmt_canary( x : i32 )->i32{   x   +1 }` appended to `crates/openfang-types/src/lib.rs` | `--- fmt : RED exit=1`, diff quoted in the block, exit **1** |
+| `/root/ofgfix-twinB/twin` | `let pi = 3.14159265358979;` (`clippy::approx_constant`) | `--- fmt : GREEN`, `--- clippy : RED exit=101`, exit **1** |
+| `/root/ofgfix-testred` | a `#[cfg(test)]` test asserting `"red" == "green"` | `--- fmt : GREEN`, `--- clippy : GREEN`, `--- test : RED exit=101`, exit **1** |
+
+And the tool-refusal codes are exercised separately, so that they are never mistaken for
+a red patch: `3` with `OFGATE_DISK_MIN_G=999` and with `OFGATE_DISK_MIN_G=lots` → `2`,
+`4` with `OFGATE_DEADLINE_S=25` against a canary whose `build.rs` sleeps 3000 s.
+
+The unmodified copy of the fork and the fork itself produce the **same** `binding` line —
+`tree-sha256:2545f3c1fbb2c96389c913204f6b782a (711 файлов)` — which is what a content
+binding is supposed to do; appending one function to the copy changes it to
+`b4ce53a6ae9d9d7c7612bbd00ad03600`.
+
+
+## `ofledger` — sums up every run's "не проверял" list, and finds the repeats
+
+    ofledger --dir ~/.claude/projects/-root/<session-id>/workflows
+    ofledger --dir <path-to-workflows> --since 2026-08-16
+    ofledger --dir <path-to-workflows> --json | python3 -m json.tool
+
+Every subagent report ends with an "unfinished/несделано" list — direct, honest,
+and, until now, unread. `ofledger` walks `wf_*.json` run files, pulls every such
+field out of `result` (wherever it's nested — the schema is not consistent run to
+run), drops items that explicitly say there's nothing unfinished ("нет — все пункты
+приёмки выполнены", bare "none"), splits the rest into individual items, and groups
+items that are the same gap worded differently. A gap that shows up in **two or
+more** separate runs is flagged as an escalation instead of a third silent repeat.
+
+Grouping (2026-08-21 rewrite — v1 glued unrelated escalations together; an
+adversarial pass hand-counted 23 foreign items out of 45 escalated, mostly by
+treating a single shared ticket-number or CLI flag as proof of sameness):
+one shared ticket key (`A-6`, `FANG-43`) is no longer enough by itself — it now
+needs a *second* shared ticket key, or one key plus >= 2 shared significant words,
+or (without any shared key) >= 30% word-Jaccard with >= 2 shared words. CLI flags
+(`--workspace`, `--stat`, ...) never glue on their own — a lone `--stat` in common
+was exactly what merged two unrelated escalations in v1. A small hand-curated
+synonym list (`CAUSE_TAGS`) merges worded-differently mentions of the *same* root
+cause — `--workspace`, `glib-2.0`, `gobject-2.0`, `gtk-*` all fold into one
+"build image missing glib/gtk" tag, which is what finally shows that gap as one
+6-run escalation instead of two disjoint 4-run ones. See the script's own docstring
+for the exact rules and, just as importantly, where each of them is known to
+misfire (transitive over-merging, missed cross-language duplicates, ticket-shaped
+substrings inside volume/branch names, and the synonym list gluing any unrelated
+gtk/glib mention).
+
+It also rolls up `workflowProgress` into an agent summary: done/error counts,
+retries, tokens/time by model, and — separately — errors at `attempt == 1`, which
+mean the work was lost outright, not just delayed. Exit 0 only when it actually
+found something to report on **two or more** runs; exit 2 on missing/empty input,
+a single-run directory (nothing to compare — a lone run can't "repeat"), or bad
+arguments — never a quiet empty success.
