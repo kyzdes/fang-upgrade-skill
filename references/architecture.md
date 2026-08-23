@@ -1,9 +1,9 @@
 # OpenFang Runtime Architecture (verified against v0.6.9 source)
 
 Ground truth for the stock behaviour documented here is tag `v0.6.9` / commit `acf2587`, mirrored
-on the `main` branch of this repo. **`/opt/openfang` is not that checkout** — it now runs the fork
-(`ours`), several commits ahead; check `git -C /opt/openfang branch --show-current` before citing
-it as stock. `docs/architecture.md` and `docs/configuration.md` in the stock tree are aspirational
+on this repo's history up to `acf2587`. **`/opt/openfang` is not that checkout** — it now runs the
+fork's `main` branch, several commits ahead; check `git -C /opt/openfang log -1 --oneline` before
+citing it as stock. `docs/architecture.md` and `docs/configuration.md` in the stock tree are aspirational
 in places — every place they diverge from code is called out explicitly below with file:line, and
 several were confirmed live against the running container (`openfang-openfang-1`, API on
 `127.0.0.1:4200`) — note the live container runs the fork, so where fork and stock differ, use

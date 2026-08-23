@@ -170,7 +170,7 @@ match_rule = { channel = "discord", channel_id = "1234567890" }
 #### 1.8a Credential leaks — closed in this fork (FANG-39/43/44), not present in stock v0.6.9
 
 Three distinct credential leaks existed on this instance under stock v0.6.9 and are fixed on
-`ours`. If this instance ever ran the stock build before these commits landed, treat every
+`main`. If this instance ever ran the stock build before these commits landed, treat every
 credential below as burned and rotate it — the fix stops future leaks, it does nothing about a
 token that already went out in a log line or a session file. `ofdoctor` does not scan session
 files for this, so do it by hand — look for a bot token pattern (`bot[0-9]+:`) or `access_token=`/

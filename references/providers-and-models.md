@@ -828,8 +828,8 @@ regardless of what `[provider_urls]` says later, since an explicit `fb.base_url`
 
 `metering.rs` lives at `crates/openfang-kernel/src/metering.rs` — on this fork and on stock
 alike. The fork modified it (FANG-60 gave `MeteringEngine` its own `LlmCounters` state for the
-Prometheus `openfang_llm_*` series, §9.4) but did not move it: `git diff --name-status main...ours`
-reports `M`, not `R`. Line numbers below shifted with that change; the path did not.
+Prometheus `openfang_llm_*` series, §9.4) but did not move it: `git diff --name-status acf2587e...main`
+(stock tag vs. the fork's current branch) reports `M`, not `R`. Line numbers below shifted with that change; the path did not.
 
 The live path is `MeteringEngine::estimate_cost_with_catalog()`
 (`crates/openfang-kernel/src/metering.rs:283`):

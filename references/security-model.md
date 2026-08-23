@@ -3,10 +3,10 @@ this repo's `main` branch)
 
 Everything below was read out of the v0.6.9 tree and, where marked **[verified live]**, reproduced
 against the running container `openfang-openfang-1` (API `http://127.0.0.1:4200`, `OPENFANG_HOME=/data`)
-— that container now runs the fork (`ours`), not a stock build, so a **[verified live]** tag here
+— that container now runs the fork (`main`), not a stock build, so a **[verified live]** tag here
 means the stock behaviour described was also confirmed on the fork, not that the fork's own
 changes are covered; those are in `SKILL.md`'s "Fork vs stock v0.6.9" table and §1.8 below.
-**`/opt/openfang` is not a tag `v0.6.9` checkout** — it runs `ours`, ahead of `acf2587`; don't cite
+**`/opt/openfang` is not a tag `v0.6.9` checkout** — it runs `main`, ahead of `acf2587`; don't cite
 it as stock. Where `docs/security.md` disagrees with the code, the code wins and the disagreement
 is called out.
 

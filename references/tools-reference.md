@@ -7,7 +7,7 @@ schemas + implementations), `agent_loop.rs` (timeouts, iteration limits), `host_
 (truncation), and `crates/openfang-types/src/{config,agent,capability}.rs`.
 
 This file originated as a survey of the bare `v0.6.9` tag (`git describe --tags` → `v0.6.9`, commit
-`acf2587`) at `/opt/openfang`. Prod has run our fork (`/root/src/openfang`, branch `ours`, three
+`acf2587`) at `/opt/openfang`. Prod has run our fork (`/root/src/openfang`, branch `main`, three
 sprints ahead) since 2026-08-09, and `tool_runner.rs`, `agent_loop.rs`, `routes.rs`, `kernel.rs` and
 `context_budget.rs` all carry fork edits that shifted line numbers below their edit points. Every
 citation into those five files has been re-verified against the fork's current tree, not the bare
@@ -231,7 +231,7 @@ the model's native tool-calling with these exact `name` values (aliases like `fs
 normalized to canonical names first via `openfang_types::tool_compat::normalize_tool_name`,
 tool_runner.rs:130). Of the 65 schemas, `file_read` is the only one the fork changed (FANG-58,
 `tool_runner.rs:571-582`); the other 64 are byte-identical to stock v0.6.9 — verified via
-`git diff main...ours -- crates/openfang-runtime/src/tool_runner.rs`, which touches only the
+`git diff acf2587e...main -- crates/openfang-runtime/src/tool_runner.rs`, which touches only the
 `file_read` definition/impl and its tests.
 
 ### Filesystem

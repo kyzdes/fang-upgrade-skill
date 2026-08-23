@@ -2,15 +2,15 @@
 
 Scope: `RightNow-AI/openfang`, evaluated against the **exact code we run**: tag `v0.6.9`, commit
 `acf2587e` — mirrored on this repo's `main` branch, live in container `openfang-openfang-1`
-(`openfang 0.6.9`) until 2026-08-09. **Not** `/opt/openfang`: that path runs our fork (`ours`) now,
-not a bare `acf2587e` checkout — see below.
+(`openfang 0.6.9`) until 2026-08-09. **Not** `/opt/openfang`: that path runs the fork's `main`
+branch now, not a bare `acf2587e` checkout — see below.
 
 Every claim below is either (a) a direct quote of an issue/PR, or (b) verified by reading v0.6.9
 source at the cited `file:line`. Where the issue text and the v0.6.9 code **disagree**, the code wins
 and the disagreement is called out explicitly.
 
 **Prod no longer runs this checkout.** Since 2026-08-09, `http://127.0.0.1:4200` runs our fork
-(`/root/src/openfang`, branch `ours`) three sprints ahead of `acf2587e`, not the bare tag. The
+(`/root/src/openfang`, branch `main`) three sprints ahead of `acf2587e`, not the bare tag. The
 triage below still describes real upstream behavior — none of the 73 issues or 45 PRs surveyed
 here overlap with what the fork changed (checked by keyword against every fix in `FORK-NOTES.md`:
 per-call metering/`model_used`/`fallback`, the fallback `base_url` fix, prompt-section tags,
@@ -20,10 +20,10 @@ applied-vs-deferred split, the Telegram token leaks, six adapters' `reqwest`-err
 tracker). So every row here is still an accurate description of a gap you'd hit on the fork too,
 **except** wherever a `file:line` citation points into `tool_runner.rs`, `agent_loop.rs`,
 `routes.rs`, or `kernel.rs` — those four files carry the fork's edits, so their line numbers below
-have been re-verified against `/root/src/openfang` on `ours` (not the untouched `acf2587e` tree)
+have been re-verified against `/root/src/openfang` on `main` (not the untouched `acf2587e` tree)
 and updated where the fork's insertions shifted them. Citations into any other file are unchanged
 from the original `acf2587e` research; check them against this repo's `main` branch (the `acf2587e`
-mirror), not against `/opt/openfang` — that path runs `ours` now, not a bare-tag checkout.
+mirror), not against `/opt/openfang` — that path runs the fork's `main` now, not a bare-tag checkout.
 
 Reproduce the raw data with:
 

@@ -19,7 +19,7 @@ maintainer. Licence, the `librefang` fork, and the cherry-pick queue:
 
 | | |
 |---|---|
-| Source | `/opt/openfang`, branch `ours` — a fork of `RightNow-AI/openfang`, ahead of upstream `main` (`acf2587`, tag `v0.6.9`, 2026-05-12). Same repo and branch (`ours`) is also checked out at `/root/src/openfang`, but the two are **not guaranteed to be at the same commit** — `/root/src/openfang` is where patches land first and can run ahead of what's actually built into the running image at `/opt/openfang`; check `git -C <path> log -1 --oneline` in both before assuming a line-number citation applies to the live container. **13 crates**, no `openfang-mcp-bridge` |
+| Source | `/opt/openfang`, branch `main` — a fork of `RightNow-AI/openfang`, ahead of upstream `main` (`acf2587`, tag `v0.6.9`, 2026-05-12). Same repo and branch (`main`) is also checked out at `/root/src/openfang`, but the two are **not guaranteed to be at the same commit** — `/root/src/openfang` is where patches land first and can run ahead of what's actually built into the running image at `/opt/openfang`; check `git -C <path> log -1 --oneline` in both before assuming a line-number citation applies to the live container. **13 crates**, no `openfang-mcp-bridge` |
 | Container | `openfang-openfang-1`, image built from source (`docker compose up --build`; GHCR is private forever, #1254). Its `agents/` directory is empty, so #1206's ~1032 idle LLM turns/day does not apply here |
 | API | `http://127.0.0.1:4200` **and** `<tailnet-ip>:4200` (Tailscale `<tailnet-host>`) |
 | `OPENFANG_HOME` | `/data` in-container = `/var/lib/docker/volumes/openfang_openfang-data/_data` on host. Called `$D` from here down |
@@ -37,11 +37,11 @@ including this one.
 
 ## Fork vs stock v0.6.9
 
-This box runs `ours`, not stock v0.6.9. If this skill is ever pointed at an unmodified
+This box runs `main`, not stock v0.6.9. If this skill is ever pointed at an unmodified
 OpenFang, everything in this table reverts to the stock behaviour on its right — check
 `git -C /opt/openfang branch --show-current` before trusting the left column.
 
-| Area | On this fork (`ours`) | Stock v0.6.9 |
+| Area | On this fork (`main`) | Stock v0.6.9 |
 |---|---|---|
 | `PUT /api/agents/{id}/update` | **501** `manifest_update_not_implemented`, body names 8 working routes (`routes.rs:6163-6230`) | **200** `{"status":"acknowledged"}`, changes nothing |
 | `remove_custom_model` | recomputes the provider's `model_count` (`openfang-runtime/src/model_catalog.rs:473-488`) | leaves `model_count` stale after a removal |

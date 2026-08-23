@@ -3,9 +3,10 @@
 Operating manual for [**fang-upgrade**](https://github.com/kyzdes/fang-upgrade) — a patched
 fork of OpenFang v0.6.9 — written for an AI agent operating a live install.
 
-This is the fork-aware companion to
-[openfang-skill](https://github.com/kyzdes/openfang-skill), which documents stock upstream
-v0.6.9. If you are running unmodified OpenFang, use that one instead.
+This was the fork-aware companion to
+[openfang-skill](https://github.com/kyzdes/openfang-skill), which documented stock upstream
+v0.6.9 — that repo is now archived, so it will not receive further updates. If you are running
+unmodified OpenFang, treat its content as a frozen snapshot rather than a maintained source.
 
 ## What is in here
 
