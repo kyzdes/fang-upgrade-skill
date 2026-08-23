@@ -412,8 +412,10 @@ sha256(path)>` when another tree owns it. So a fresh target for a run means one 
 * run against a **worktree path that has never been used before** — a new path gets a new
   volume.
 
-Both cost a cold build: 22 GB and, on the fork, 1248–1615 s wall clock. That is the price
-of the local check being honest, and it is also why the honest answer is to let CI do it.
+Both cost a cold build. The figures for the fork are **not** re-measured here — they are
+the ones already on record further down this file, from the previous revision: 22 GB of
+target, 1248–1615 s for a full run. A cold full run needs disk this box does not currently
+have free (19 GB), which is itself part of why the honest answer is to let CI do it.
 
 Use the fresh-volume form whenever the tree arrived by any of the four methods above, and
 whenever a green result would be quoted at anyone.
