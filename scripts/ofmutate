@@ -64,6 +64,54 @@ def git(wt, *args, check=True):
     return r.stdout
 
 
+def resolve_ref(wt, ref):
+    r = subprocess.run(["git", "-C", wt, "rev-parse", "--verify", "--quiet", ref],
+                       capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def default_base(wt):
+    """Имя ствола не зашивается: раньше здесь стояло literal 'ours', и когда
+    ветку удалили (переименование/уборка), инструмент падал на самом первом
+    вызове — git rev-parse на несуществующую ветку. Вместо строки — цепочка
+    источников, каждый читается из самого git, а не из константы в коде:
+
+      1. OFMUTATE_BASE  — явный override, когда ни один автодетект не подходит;
+      2. refs/remotes/origin/HEAD — то, что сам origin считает своей веткой
+         по умолчанию (пишется при клоне/`git remote set-head`), без сети;
+      3. локальные ветки-кандидаты main/master — не имя ствола этого репозитория
+         зашитое как истина, а просто порядок проверки самых частых имён;
+         первая существующая побеждает.
+
+    Если ни один источник не сработал — явный отказ со списком того, что
+    проверялось, а не тихий выбор наугад."""
+    tried = []
+
+    env = os.environ.get("OFMUTATE_BASE")
+    if env:
+        tried.append(f"OFMUTATE_BASE={env}")
+        if resolve_ref(wt, env):
+            return env
+
+    r = subprocess.run(["git", "-C", wt, "symbolic-ref", "-q",
+                        "refs/remotes/origin/HEAD"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        origin_head = r.stdout.strip().replace("refs/remotes/", "", 1)
+        tried.append(f"refs/remotes/origin/HEAD → {origin_head}")
+        if resolve_ref(wt, origin_head):
+            return origin_head
+
+    for cand in ("main", "master"):
+        tried.append(f"локальная ветка {cand}")
+        if resolve_ref(wt, cand):
+            return cand
+
+    die("не удалось определить базу автоматически, задай --base или "
+        "OFMUTATE_BASE явно. Проверено и не сработало:\n  - "
+        + "\n  - ".join(tried), 2)
+
+
 def free_gb():
     r = subprocess.run(["df", "-BG", "--output=avail", "/"],
                        capture_output=True, text=True)
@@ -222,7 +270,10 @@ def main():
     ap.add_argument("worktree")
     ap.add_argument("--test", required=True,
                     help="фильтр cargo test; пустой прогон считается отказом")
-    ap.add_argument("--base", default="ours")
+    ap.add_argument("--base", default=None,
+                    help="база для сравнения; по умолчанию автодетект "
+                         "(OFMUTATE_BASE, origin/HEAD, main, master — см. "
+                         "default_base())")
     ap.add_argument("-p", "--crate", action="append", default=[])
     ap.add_argument("--per-hunk", action="store_true",
                     help="дополнительно откатить каждый ханк по одному")
@@ -245,6 +296,8 @@ def main():
         die("рабочее дерево не чистое — откат ханков затёр бы эти изменения:\n"
             + dirty + "\n  закоммить или спрячь их и повтори", 2)
 
+    if a.base is None:
+        a.base = default_base(wt)
     git(wt, "rev-parse", "--verify", a.base)
     head = git(wt, "rev-parse", "HEAD").strip()
     if not git(wt, "diff", "--name-only", f"{a.base}...{head}").strip():
