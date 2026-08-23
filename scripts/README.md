@@ -6,9 +6,11 @@ flat-argv helpers (`shell_exec` rejects pipes/redirection, so intake logic has t
 a script file, not a prompt); `ofcheck-rs` runs on the host but talks to neither — it
 drives a throwaway `rust:1-slim-bookworm` container to `cargo check` a worktree, so
 patches can be checked without installing Rust on the host — but see the warning in its
-section: **its exit code is always 0**, so it cannot be used as proof. `ofgate` is the
-tool that can. `ofmutate` proves a test would go red without its patch, and `ofledger`
-reads the workflow journals. Everything is POSIX `sh` or
+section: **its exit code is always 0**, so it cannot be used as proof. Neither can
+`ofgate`, for two different reasons set out in its own section — the gate that decides
+"done" is **CI**, and the only artefact that counts as evidence is a CI run id.
+`ofmutate` reverse-applies a patch to check its test would go red without it, and
+`ofledger` reads the workflow journals. Everything is POSIX `sh` or
 python3 stdlib, so they have no dependency beyond what is already on the host, and
 nothing to install in the container (which has no `curl`). Each of the five API tools and
 `ofcheck-rs` takes `--help`.
@@ -17,11 +19,31 @@ Put them on `$PATH` once per session, or call them by absolute path:
 
     export PATH="$HOME/.claude/skills/fang-upgrade/scripts:$PATH"
 
-`ofctl`, `ofdoctor`, `ofhand`, `ofcron` and `ofbackup` honour `OPENFANG_URL`,
-`OPENFANG_HOME_HOST`, `OPENFANG_CONTAINER` and `OPENFANG_API_KEY`, so they can be pointed
-at a second instance or at a scratch directory for a dry run. `ofcheck-rs` is unrelated to
-the OpenFang API and ignores all four — it only takes a worktree path and optional crate
-names.
+The five API tools can be pointed at a second instance or a scratch directory, but **not
+all of them read the same variables**, and an earlier revision of this file claimed they
+did. What each script actually references, read out of the scripts with
+`grep -q <VAR> <script>` on 2026-08-23:
+
+| | `OPENFANG_URL` | `OPENFANG_CONFIG` | `OPENFANG_API_KEY` | `OPENFANG_HOME_HOST` | `OPENFANG_CONTAINER` |
+|---|---|---|---|---|---|
+| `ofctl` | yes | yes | yes | **no** | **no** |
+| `ofdoctor` | yes | yes | **no** | yes | yes |
+| `ofhand` | yes | yes | yes | yes | yes |
+| `ofcron` | yes | yes | yes | yes | **no** |
+| `ofbackup` | **no** | **no** | **no** | yes | yes |
+
+The gap bites in practice: pointing `ofctl` at the staging instance with
+`OPENFANG_HOME_HOST` leaves it reading **production's** `config.toml` and sending
+production's key to staging. Measured:
+
+    $ OPENFANG_URL=http://127.0.0.1:4201 \
+      OPENFANG_HOME_HOST=/var/lib/docker/volumes/openfang-staging-data/_data \
+      ofctl --show-key-source
+    source: /var/lib/docker/volumes/openfang_openfang-data/_data/config.toml (top-level api_key)
+
+`ofctl` takes `OPENFANG_CONFIG` for that; with it the source line names the staging file.
+`ofcheck-rs` is unrelated to the OpenFang API and ignores all of them — it only takes a
+worktree path and optional crate names.
 
 ## `ofctl` — authenticated API calls
 
@@ -29,7 +51,8 @@ names.
     ofctl -x total GET /api/models                      # 206
     ofctl POST /api/agents/$AID/message '{"message":"Reply with exactly: PONG"}'
     ofctl PUT  /api/cron/jobs/$JID/enable '{"enabled":true}'
-    ofctl -s -n GET /api/cron/jobs                      # 200 = served with no credential
+    ofctl -s -n GET /api/cron/jobs                      # no credential: 200 without
+                                                        # passkey, 401 with it
 
 Replaces `K=$(grep … config.toml); curl -H "Authorization: Bearer $K" …`.
 It reads the **top-level** `api_key` with awk that stops at the first `[table]`,
@@ -39,6 +62,29 @@ goes to curl through a 0600 `--config` file, so it never appears in `ps` output
 or shell history. `-x` pulls one value out of the JSON (`-x jobs.0.id`), `-n`
 sends no credential so you can test what is genuinely public, and a non-2xx
 status becomes a non-zero exit.
+
+**With passkey auth on, `ofctl`'s default URL stops working, and the failure looks like a
+wrong key.** The machine key is only accepted from loopback and the tailnet
+(`middleware.rs`, `is_operator_network` + `machine_key_allowed_here`), and the address the
+daemon sees is the socket peer, never `X-Forwarded-For`. A container behind a *loopback*
+published port never sees loopback: Docker's userland proxy rewrites the source to the
+bridge gateway. A port published on the **tailnet** address is DNAT'd instead, and the real
+source survives. Same scratch daemon, `auth.enabled = true`, same key, one instant:
+
+    127.0.0.1:4298     published loopback port   -> 401 {"error":"Invalid API key"}
+    100.91.165.20:4298 published tailnet port    -> 200
+    127.0.0.1:4200     from inside the container -> 200
+
+    $ OPENFANG_URL=http://127.0.0.1:4298    ofctl GET /api/version ; echo $?
+    ofctl: HTTP 401 on GET /api/version
+    1
+    $ OPENFANG_URL=http://100.91.165.20:4298 ofctl -x git_sha GET /api/version ; echo $?
+    1009ed230dcbbc86afd81d0dd17c5cd83e1b7231
+    0
+
+So on a passkey box `ofctl` needs `OPENFANG_URL=http://<tailnet-ip>:4200`, or the call has
+to be made from inside the container. `401 Invalid API key` here means "right key, wrong
+source address", which is exactly what it does not say.
 
 ## `ofdoctor` — preflight that knows what the real doctor gets wrong
 
@@ -56,6 +102,20 @@ collision, **the daemon key or a provider secret appearing verbatim in an
 unauthenticated response**, cron jobs carrying credential-shaped delivery
 targets or nearing the 5-failure auto-disable, hands on disk that were never
 loaded, missing container binaries, file modes, WAL size. Exit 1 on any FAIL.
+
+**Its `authenticated request rejected` remedy is wrong on a passkey box**, and it is the
+first line an operator reads. Run against staging (`auth.enabled = true`, correct 51-char
+key) it prints:
+
+    [FAIL] authenticated request rejected   /api/security with key -> 401
+                                            -> an empty-bodied 400 means a malformed header:
+                                               `ofctl --show-key-source` should say 51 chars
+    [WARN] cron jobs unreadable             GET /api/cron/jobs -> 401
+
+The key is fine and the header is fine; the request came through a loopback published port,
+so the daemon saw the bridge gateway and declined the machine-key short path — see the
+`ofctl` section above. Read those two lines as "passkey is on and I am calling the wrong
+address", not as a broken key. `ofdoctor` has not been taught the difference.
 
 ## `ofhand` — the hand lifecycle that survives a restart
 
@@ -183,6 +243,14 @@ character (including the trailing `-` that `tr` leaves from `basename`'s newline
 so builds stay incremental and no extra disk is consumed. Measured on
 `crates/openfang-runtime`: 203 s cold for the first run, 35 s for the second.
 
+**That name is the old, unsafe scheme, and `ofmutate` still uses it.** `volume_slug()`
+(`ofmutate:73-76`) is `basename` and nothing else — no owner marker, no path hash — which
+is precisely the naming `ofgate` had to abandon because two trees whose directories share a
+name share a build volume and one silently returns the other's result (`ofgate`'s section,
+"Build target isolation"). Two worktrees called `.../twin` collide here today. Until this is
+fixed, run `ofmutate` from a uniquely named worktree, or `docker volume rm
+fang-target-<basename>-` first.
+
 ## `ytwatch.py` — YouTube intake, runs *inside* the container
 
 Lists a channel's newest videos, fetches auto-captions **without downloading
@@ -212,9 +280,9 @@ ids are 32-char hex instead of YouTube's 11-char base64 form. Install the same w
 `ytwatch.py` — `mkdir -p` the workspace `bin/` first, then `docker cp`.
 
 ---
-## `ofgate` — the one command that decides "done"
+## `ofgate` — a fast local check before you push. Not a gate.
 
-    ofgate <worktree>                        # full gate, 9-minute self-deadline
+    ofgate <worktree>                        # full run, 9-minute self-deadline
     ofgate <worktree> --wait                 # same, 4-hour budget, for Bash run_in_background
     ofgate <worktree> --only fmt
     ofgate <worktree> --only fmt,clippy --wait
@@ -230,6 +298,132 @@ command lines copied out of that file rather than from memory:
 
 The `-- --test-threads=2` on the test step is in the workflow (it bounds peak memory on
 GitHub runners), so it is here too. Like CI, `ofgate` stops at the first red step.
+
+### What it is, and what decides "done"
+
+An earlier revision of this file titled this section "the one command that decides
+'done'". That was false on two counts, and both were established by running the tool, not
+by argument.
+
+**One: evidence printed by the claimant is forgeable in a minute.** The verdict block is
+self-signed — its closing `sha256` covers the body printed above it, the step hashes cover
+files the same process wrote, and there is no key (`grep -n
+'hmac\|secret\|OFGATE_KEY\|openssl' ofgate` returns nothing). Redone from scratch on
+2026-08-23: a full three-step GREEN block typed into a file, one `sha256sum` of the body
+appended as the closing line, and it self-checks —
+
+    $ head -n -1 fake.txt | sha256sum | cut -d' ' -f1
+    fb087f2141c8344469a9a6aa52b904bf1d15ea14bd25ee0f5b63e9ffe0953c2b
+    $ grep -o 'body-sha256=[0-9a-f]*' fake.txt
+    body-sha256=fb087f2141c8344469a9a6aa52b904bf1d15ea14bd25ee0f5b63e9ffe0953c2b
+    $ docker ps -a --filter ancestor=ofgate-build:1.91 -q | wc -l
+    0
+
+— zero containers, elapsed under a minute. The tool says so itself on every run, on stderr:
+
+    ofgate: блок выше НЕ заверен — он самоподписан и подделывается вручную.
+            Доказательство — перезапуск гейта проверяющим.
+
+**Two, and worse: it can print GREEN without building anything.** See the next subsection.
+A tool that can lie green is worse than no tool, because people believe it.
+
+**What counts as evidence is a CI run id.** `.github/workflows/fork-ci.yml` triggers on
+push to `main` and on pull requests into it, so pushing a branch runs nothing: branch → PR
+→ green CI → merge. The run id cannot be invented, and it carries the commit it ran on:
+
+    $ gh run view -R kyzdes/fang-upgrade 32627036232 --json conclusion,headSha,workflowName
+    {"conclusion":"success",
+     "headSha":"1009ed230dcbbc86afd81d0dd17c5cd83e1b7231",
+     "workflowName":"Fork CI (ours)"}
+
+    $ gh run view -R kyzdes/fang-upgrade 99999999999 --json conclusion,headSha >/dev/null 2>&1; echo $?
+    1
+
+Three things about that command, each a way to read a red run as green:
+
+* **`-R` is not optional.** `/root/src/openfang` has three remotes and no default repo set,
+  so `gh` picks `upstream`. Without `-R` the same id gives
+  `HTTP 404: Not Found (…/repos/RightNow-AI/openfang/actions/runs/32627036232)`.
+* **An empty `conclusion` is not a pass.** A run in flight reports
+  `{"conclusion":"","status":"in_progress"}` — measured on run `32666318113` while it was
+  still going. Ask for `status` alongside `conclusion` and require `completed` + `success`.
+* **Check `headSha` against what you are claiming green.** A run id proves that *some*
+  commit passed.
+
+So: use `ofgate` to fail fast locally and save CI round trips. Cite CI.
+
+### The false green: a reused build volume and an mtime that did not move
+
+`ofgate` keys its build-target volume to the worktree **path** and mounts the tree at a
+fixed `/build`. Cargo's freshness check keys on path plus mtime. Put those together: if the
+tree at that path is replaced by different content whose mtimes are **not newer** than the
+previous run's artefacts, cargo finds its fingerprints valid, rebuilds nothing, and
+`ofgate` reports the previous run's result on code it never compiled.
+
+Every ordinary way of deploying a tree hits this, because none of them stamps "now":
+
+    source file mtime 2026-08-01 10:00:00, commit dated 2026-08-05 12:00:00,
+    wall clock at the time of the test 2026-08-23 22:09
+      cp -a               -> 2026-08-01 10:00:00     (source mtime preserved)
+      rsync -a            -> 2026-08-01 10:00:00     (source mtime preserved)
+      git archive | tar -x-> 2026-08-05 12:00:00     (commit date)
+      docker cp           -> 2026-08-01 09:00:00 UTC (source mtime preserved)
+
+Reproduced with `cp -a`, on a two-file canary, no `touch` anywhere — both source trees were
+created before the first run, so nothing had to be back-dated. Run 1 on the clean tree, run
+2 after `cp -a` of a tree carrying `let pi = 3.14159265358979;` (`clippy::approx_constant`),
+run 3 on the same bad tree after deleting the volume:
+
+    # 1 — clean tree
+    binding    : … tree-sha256:970fd64586bdaf2475fcbc72ec6d38e9 (2 файлов)
+    target-vol : fang-target-skp-fg-tree-
+    --- clippy : GREEN  exit=0  1s        log 115 B
+    exit       : 0
+
+    # 2 — bad tree at the same path, same volume, cp -a
+    binding    : … tree-sha256:36c108a9161ef8c4d8032737f6aab131 (2 файлов)   ← different tree
+    target-vol : fang-target-skp-fg-tree-
+    --- clippy : GREEN  exit=0  0s        log 72 B                          ← FALSE GREEN
+    exit       : 0
+    $ cat …/clippy.log
+        Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s   ← no `Checking` line
+
+    # 3 — same bad tree, volume removed first
+    $ docker volume rm fang-target-skp-fg-tree-
+    binding    : … tree-sha256:36c108a9161ef8c4d8032737f6aab131 (2 файлов)   ← identical to run 2
+    --- clippy : RED  exit=101  0s
+          | error: approximate value of `f{32, 64}::consts::PI` found
+          |  --> src/lib.rs:2:14
+    exit       : 1
+
+Runs 2 and 3 differ in nothing but the build volume. The `binding` line does change — it
+hashes tree content — so a reader comparing two blocks can *notice*, but `ofgate` does not
+compare, and `result : GREEN` is what goes into a report.
+
+**The workaround, from the code rather than from memory.** `ofgate` has no environment
+variable for the target volume: the whole list is `OFGATE_DEADLINE_S`, `OFGATE_DISK_MIN_G`,
+`OFGATE_LOG_DIR`, `OFGATE_ADOPT_LEGACY_VOL`. The volume name is computed from the worktree
+path — `fang-target-$(basename)` while that name is free, `fang-target-<basename><12 hex of
+sha256(path)>` when another tree owns it. So a fresh target for a run means one of:
+
+* `docker volume rm fang-target-<basename>-` before the run (note the trailing `-`: it is
+  the newline `basename` prints, turned into a dash by `tr`), which is what run 3 above
+  does; or
+* run against a **worktree path that has never been used before** — a new path gets a new
+  volume.
+
+Both cost a cold build: 22 GB and, on the fork, 1248–1615 s wall clock. That is the price
+of the local check being honest, and it is also why the honest answer is to let CI do it.
+
+Use the fresh-volume form whenever the tree arrived by any of the four methods above, and
+whenever a green result would be quoted at anyone.
+
+**The error is one-way, which is why the tool is still worth running.** Cargo does not
+fingerprint a failed compile, so a volume that has just gone red does not keep returning
+red. Measured on a second canary: bad tree on a fresh volume → `--- clippy : RED exit=101`,
+then the good tree `cp -a`'d over it (mtime *older* than the failed run) on that same
+volume → `--- clippy : GREEN exit=0`. So a **red** `ofgate` is worth acting on immediately;
+it is **green** that carries no information until CI says so.
 
 Exit codes: `0` every requested check green · `1` at least one red · `2` bad arguments ·
 `3` the tool declining · `4` the run did not fit `ofgate`'s own deadline. **`3` and `4`
@@ -552,16 +746,25 @@ plainly when the result is *not* bound to a commit:
     binding    : НЕ привязано к коммиту: дерево грязное (HEAD 1aa58ee…) · tree-sha256:440c1c2db63b7c2e139e5107a00f9cae (2 файлов)
 
 That is a binding, not a signature: it does not stop forgery, it just means the same
-block quoted against a different tree is identifiable as a different tree. **A verdict
-block is evidence only after the reader re-runs the gate.** `ofverify` exists for that;
-`ofgate` does not certify itself.
+block quoted against a different tree is identifiable as a different tree.
+
+An earlier revision closed this subsection with "a verdict block is evidence only after
+the reader re-runs the gate — `ofverify` exists for that". Both halves are wrong and are
+removed. There is no `ofverify`: `ls ~/.claude/skills/*/scripts/ofverify` →
+`No such file or directory`, and `find /root/src/openfang -name 'ofverify*'` returns
+nothing. And re-running is not enough on its own — a re-run on the same warm volume can
+reproduce the same false green, which is the whole point of the subsection above. A
+verdict block is a convenience for reading; the evidence is a CI run id.
 
 ### Proof that it can go red
 
 The predecessor is broken precisely because nobody ran it against a known-bad tree, so
 every check here has been run against one. These are runs of *this* revision, on
-canaries built for it — a green run on a clean tree proves nothing on its own, since a
-tool that always exits 0 produces one too:
+canaries built for it — `git log -- scripts/ofgate` shows one commit, the import, so the
+script has not moved since. A green run on a clean tree proves nothing on its own, since a
+tool that always exits 0 produces one too. (Note what this section does and does not
+establish: that the tool *can* report red on a bad tree — not that a green result means a
+tree is good. See "The false green" above.)
 
 | canary | what is wrong with it | result |
 |---|---|---|
