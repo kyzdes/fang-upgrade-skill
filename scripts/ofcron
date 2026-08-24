@@ -28,11 +28,38 @@ import sys
 import urllib.error
 import urllib.request
 
-HOME_HOST = os.environ.get(
-    "OPENFANG_HOME_HOST", "/var/lib/docker/volumes/openfang_openfang-data/_data"
-)
+TOOL = "ofcron"
+# --- which install are we about to act on? -----------------------------------
+# The answer used to be a constant naming one particular deployment. It is now
+# derived and refused when ambiguous — see scripts/oftarget.py for why.
+import importlib.util as _ilu
+
+_spec = _ilu.spec_from_file_location(
+    "oftarget", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "oftarget.py"))
+oftarget = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(oftarget)
+_HELP_ONLY = any(a in ("-h", "--help") for a in sys.argv[1:])
+
+
+def _refuse(exc):
+    print(f"{TOOL}: {exc}", file=sys.stderr)
+    sys.exit(2)
+
 BASE_URL = os.environ.get("OPENFANG_URL", "http://127.0.0.1:4200").rstrip("/")
-CONFIG = os.environ.get("OPENFANG_CONFIG", os.path.join(HOME_HOST, "config.toml"))
+
+
+def config_path():
+    """ofcron only needs the install's data directory to find config.toml, so it
+    resolves the target lazily: an explicit OPENFANG_CONFIG asks nothing of
+    docker at all."""
+    explicit = os.environ.get("OPENFANG_CONFIG")
+    if explicit:
+        return explicit
+    try:
+        return os.path.join(oftarget.home_host()[0], "config.toml")
+    except oftarget.Refused as exc:
+        _refuse(exc)
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9 _-]{1,128}$")
@@ -49,7 +76,7 @@ def api_key():
     if os.environ.get("OPENFANG_API_KEY"):
         return os.environ["OPENFANG_API_KEY"]
     try:
-        with open(CONFIG) as fh:
+        with open(config_path()) as fh:
             for line in fh:
                 s = line.strip()
                 if s.startswith("["):
@@ -59,7 +86,7 @@ def api_key():
                     return m.group(1)
     except OSError:
         pass
-    die(f"no top-level api_key in {CONFIG} (set OPENFANG_API_KEY)", 2)
+    die(f"no top-level api_key in {config_path()} (set OPENFANG_API_KEY)", 2)
 
 
 def request(method, path, body=None, timeout=30):

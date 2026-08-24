@@ -14,7 +14,7 @@ unmodified OpenFang, treat its content as a frozen snapshot rather than a mainta
 |---|---|
 | `SKILL.md` | the manual itself — daemon, agents, hands, cron, providers, channels, the API |
 | `references/` | eleven deep-dives loaded on demand: architecture, providers and models, hands, automation, the 65 builtin tools, the security model, skills and ClawHub, channels/MCP/A2A, known issues, a worked pipeline, and a fresh-server runbook |
-| `scripts/` | twelve scripts: `ofctl` (authenticated API calls), `ofdoctor` (health pass with a secret-leak scan), `ofhand`, `ofcron`, `ofbackup`, `ofcheck-rs`, `ofgate` (the three cargo commands Fork CI's `check` job runs — **not** a gate; see `scripts/README.md`), `ofmutate` (proves a patch's test goes red without the patch), `ofledger` (rolls up the workflow journals), `ofscrub` (checks the placeholder promise below), plus intake tools for YouTube and RuTube |
+| `scripts/` | thirteen scripts: `ofctl` (authenticated API calls), `ofdoctor` (health pass with a secret-leak scan), `ofhand`, `ofcron`, `ofbackup`, `oftarget.py` (works out *which* install a tool is about to act on, and refuses when that is not unique), `ofcheck-rs`, `ofgate` (the three cargo commands Fork CI's `check` job runs — **not** a gate; see `scripts/README.md`), `ofmutate` (proves a patch's test goes red without the patch), `ofledger` (rolls up the workflow journals), `ofscrub` (checks the placeholder promise below), plus intake tools for YouTube and RuTube |
 | `evals/` | trigger evaluations for the skill description |
 
 ## Install
@@ -26,14 +26,25 @@ chmod +x ~/.claude/skills/fang-upgrade/scripts/*
 export PATH="$HOME/.claude/skills/fang-upgrade/scripts:$PATH"
 ```
 
-Point the tools at your install:
+Point the tools at your install. **They do not ship a default target.** `ofdoctor`,
+`ofhand`, `ofcron`, `ofbackup` and `ofctl` used to default to a container name and a
+volume path — names that `docker compose` derives for *everybody* who follows the upstream
+compose file, so the default silently acted on whichever install answered to the name, and
+picked the live one for anybody running a staging box beside it. Now the target is
+discovered from the running containers and **refused when it is not unique**:
 
 ```bash
+scripts/oftarget.py show          # which container, which data directory, and how each was decided
 export OPENFANG_URL=http://127.0.0.1:4200
-export OPENFANG_CONFIG=/var/lib/docker/volumes/openfang_openfang-data/_data/config.toml
+export OPENFANG_CONTAINER=<container>     # only needed when more than one is running
 ofctl -x version GET /api/health
 ofdoctor
 ```
+
+With one OpenFang container running, nothing needs setting: the tools find it and say which
+one they picked. With none, or with two, they exit 2 and list what they saw rather than
+guess. `OPENFANG_HOME_HOST` is likewise read off the chosen container's own mount table, so
+it cannot name a different install than the container the tool is about to restart.
 
 ## Testing a patch against the fork
 
@@ -46,11 +57,20 @@ skill: `tests/fang/harness/` (`fangrig --help`, `tests/fang/harness/README.md`).
 
 Addresses and host names appear as `<tailnet-ip>`, `<public-ip>`, `<tailnet-host>`; the passkey
 relying party appears as `<rp-host>` and a passkey slot as `<slot>` — substitute your own. That is
-a promise, so it is checked by a run rather than by eye: `scripts/ofscrub` greps the whole tree
-(bar `.git/` and its own source, which quotes the strings it hunts for) for the classes of text that
-name one particular install, and exits non-zero on a hit. It was red on the
-tree published before this sentence existed (five rules hit, in `SKILL.md` and `scripts/README.md`)
-and is green now. Paths assume the Docker install described in
+a promise, so it is checked by a run rather than by eye: `scripts/ofscrub` scans the whole tree —
+**including its own source**, with no exemption — and exits non-zero on a hit.
+
+It checks *shapes*, not a list of names, and it reports a hit by file and line without printing
+the value. A guard for a public repository cannot hold the names it hunts: an earlier version
+stored them as `(length, FNV-1a, SHA-256)` and a 1603-word dictionary recovered every one of them
+in a fraction of a second. So the rules ask what a value *is*, not whose it is: an IP literal that
+is globally routable, a Tailscale carrier-NAT address, a `*.ts.net` name, or any non-placeholder
+value standing in a key whose content is the install's identity (`rp_id`, `rp_origin`, `slot`, an
+`openfang auth` slot argument, `OPENFANG_URL`). It therefore catches an install that is not this
+one — verified against a canary of a foreign deployment's values — and stays silent on loopback,
+RFC 1918, the RFC 5737/3849 documentation ranges and `.example`/`.invalid`/`.test` names. What it
+cannot see (a bare domain in prose, a container name) is written in its own header, so a green run
+is not mistaken for proof of more than it checks. Paths assume the Docker install described in
 [fang-upgrade/INSTALL-AGENT.md](https://github.com/kyzdes/fang-upgrade/blob/main/INSTALL-AGENT.md).
 
 **A caveat worth reading before you trust a section.** `SKILL.md`'s "Fork vs stock v0.6.9" table is

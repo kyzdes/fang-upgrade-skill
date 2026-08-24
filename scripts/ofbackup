@@ -15,9 +15,19 @@
 # POSIX sh; needs docker, tar, python3.
 set -eu
 
-HOME_HOST=${OPENFANG_HOME_HOST:-/var/lib/docker/volumes/openfang_openfang-data/_data}
-CONTAINER=${OPENFANG_CONTAINER:-openfang-openfang-1}
+# Which install are we about to snapshot, stop and overwrite? The answer used to
+# be a constant naming one particular deployment; it is now derived, and refused
+# when ambiguous. See scripts/oftarget.py for the reasoning.
 HOME_CTR=${OPENFANG_HOME_CTR:-/data}
+OFTARGET=$(dirname "$(readlink -f "$0")")/oftarget.py
+case "${1:-}" in
+    -h|--help|"") ;;    # --help must work with no install present at all
+    *)
+        CONTAINER=$(python3 "$OFTARGET" container) || exit 2
+        HOME_HOST=$(OPENFANG_CONTAINER="$CONTAINER" python3 "$OFTARGET" home) || exit 2
+        echo "ofbackup: target $CONTAINER  ($HOME_HOST)" >&2
+        ;;
+esac
 
 # Everything here is either irreplaceable or expensive to rebuild by hand.
 # Anything absent is skipped silently - this box has no workflows/ dir.
@@ -49,8 +59,10 @@ RESTORE, in short
   top of a good snapshot.
 
 ENVIRONMENT
-  OPENFANG_HOME_HOST  default /var/lib/docker/volumes/openfang_openfang-data/_data
-  OPENFANG_CONTAINER  default openfang-openfang-1
+  OPENFANG_CONTAINER  the container to act on. Unset: discovered from the
+                      running containers, and REFUSED if that is not unique.
+  OPENFANG_HOME_HOST  the data directory on the host. Unset: read off the
+                      chosen container's own mount table.
 EOF
 }
 

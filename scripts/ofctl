@@ -16,7 +16,12 @@
 set -eu
 
 OF_URL=${OPENFANG_URL:-http://127.0.0.1:4200}
-OF_CONFIG=${OPENFANG_CONFIG:-/var/lib/docker/volumes/openfang_openfang-data/_data/config.toml}
+# OPENFANG_CONFIG unset: work the path out from the running container rather
+# than from a constant naming one particular deployment (scripts/oftarget.py).
+# Resolved only when it is actually needed — with OPENFANG_API_KEY set, ofctl
+# never looks at a config file and never calls docker.
+OF_CONFIG=${OPENFANG_CONFIG:-}
+OFTARGET=$(dirname "$(readlink -f "$0")")/oftarget.py
 
 usage() {
     cat <<'EOF'
@@ -57,7 +62,8 @@ EXAMPLES
 ENVIRONMENT
   OPENFANG_API_KEY  use this key instead of reading config.toml
   OPENFANG_URL      base URL (Tailscale: http://<tailnet-ip>:4200)
-  OPENFANG_CONFIG   path to config.toml on the host
+  OPENFANG_CONFIG   path to config.toml on the host. Unset: derived from the
+                    running OpenFang container, and refused if that is not unique.
 EOF
 }
 
@@ -79,6 +85,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# OF_CONFIG must be settled in the MAIN shell, not inside read_key: read_key is
+# always called in a command substitution, so an assignment made there is lost
+# with the subshell and every later "$OF_CONFIG" would read as empty.
+resolve_config() {
+    [ -n "$OF_CONFIG" ] && return 0
+    [ -n "${OPENFANG_API_KEY:-}" ] && return 0   # the file is never opened
+    _h=$(python3 "$OFTARGET" home) || exit 2
+    OF_CONFIG="$_h/config.toml"
+}
+
 read_key() {
     if [ -n "${OPENFANG_API_KEY:-}" ]; then
         printf '%s' "$OPENFANG_API_KEY"
@@ -97,6 +113,7 @@ read_key() {
 }
 
 if [ -n "$keysrc" ]; then
+    resolve_config
     k=$(read_key)
     if [ -n "${OPENFANG_API_KEY:-}" ]; then src='$OPENFANG_API_KEY'; else src="$OF_CONFIG (top-level api_key)"; fi
     echo "source: $src"
@@ -114,6 +131,7 @@ trap 'rm -rf "$tmpd"' EXIT INT TERM HUP
 curlrc=$tmpd/curlrc
 : > "$curlrc"; chmod 600 "$curlrc"
 if [ -z "$noauth" ]; then
+    resolve_config
     key=$(read_key)
     [ -n "$key" ] || { echo "ofctl: no api_key found in $OF_CONFIG" >&2; exit 2; }
     printf 'header = "Authorization: Bearer %s"\n' "$key" >> "$curlrc"
@@ -135,7 +153,7 @@ code=$(curl "$@" "$OF_URL$path") || crc=$?
 if [ "$crc" -ne 0 ]; then
     case $crc in
         28) echo "ofctl: timed out after ${timeout}s. Raise -t, or note that /api/logs/stream is an endless SSE stream and will always time out." >&2 ;;
-        *)  echo "ofctl: no response from $OF_URL (curl exit $crc - is openfang-openfang-1 up?)" >&2 ;;
+        *)  echo "ofctl: no response from $OF_URL (curl exit $crc - is the daemon up?)" >&2 ;;
     esac
     exit 2
 fi

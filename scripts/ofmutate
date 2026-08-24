@@ -30,12 +30,28 @@
 #                 проверить результат. Тогда нужен --per-hunk: он откатывает ханки по
 #                 одному и показывает, какие из них тест не замечает вовсе.
 #
-# Прогон идёт в том же контейнере и на том же томе цели сборки, что ofcheck-rs
-# (fang-target-<basename>-), поэтому сборка инкрементальная и лишнего места не съедает.
-# Имя тома воспроизводит поведение ofcheck-rs дословно, включая завершающий дефис от
-# `tr` над переводом строки — расхождение в имени стоило бы холодной сборки на ~4.5 мин.
+# ── ПРО ИЗОЛЯЦИЮ ЦЕЛИ СБОРКИ ────────────────────────────────────────────────
+# Прогон идёт в контейнере на томе цели сборки fang-target-<basename>-, поэтому сборка
+# инкрементальная. Одного basename для ВЫБОРА тома мало, и это не теория:
+# /root/ofmfix-twinA/twin и /root/ofmfix-twinB/twin — разные деревья с одинаковым
+# именем каталога; B, чей тест обязан падать, получил от этого инструмента
+# GREEN passed=1 на том же бинаре теста twin-62218c97741a28ad, что собрало A, за 0.07 с
+# без единой строки компиляции. Отпечатки cargo завязаны на путь и mtime, а внутри
+# контейнера оба дерева монтируются по одному пути /build.
+#
+# Владение томом закреплено меткой .ofgate-owner ВНУТРИ САМОГО ТОМА — той же самой,
+# которую пишет и читает ofgate. Метка описывает том, а не инструмент, поэтому оба
+# инструмента делят прогретый том одного дерева и не делят его между разными:
+#   · тома нет            → создаём, пишем метку с реальным путём дерева;
+#   · метка совпала       → это наш том, идём инкрементально;
+#   · метка чужая         → уходим на fang-target-<slug><12 знаков sha256 пути>;
+#   · метки нет (том от ofcheck-rs или от старой версии) → НЕ занимаем молча: уходим
+#     на том с хэшем пути. Занять безымянный том можно только явно,
+#     OFMUTATE_ADOPT_LEGACY_VOL=1, и только зная, какое дерево его набивало.
+# Схема имён совпадает с ofgate знак в знак, чтобы прогретый том переиспользовался.
 
 import argparse
+import hashlib
 import os
 import re
 import subprocess
@@ -47,6 +63,9 @@ import time
 # сам отказ по диску можно было прогнать (иначе это ветка, которая никогда не проверялась).
 DISK_MIN_G = int(os.environ.get("OFMUTATE_DISK_MIN_G", "12"))
 IMAGE = "rust:1-slim-bookworm"
+# Та же метка владельца тома, что у ofgate: она описывает ТОМ, а не
+# инструмент, поэтому оба тула делят прогретый том одного дерева.
+OWNER_STAMP = ".ofgate-owner"
 APT = ("apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq "
        "pkg-config libssl-dev perl make >/dev/null 2>&1;")
 
@@ -125,6 +144,68 @@ def volume_slug(wt):
     return "".join(c if re.match(r"[a-zA-Z0-9_.-]", c) else "-" for c in base)
 
 
+def path_hash(wt):
+    """12 знаков sha256 пути дерева — ровно как их берёт ofgate:
+    `printf '%s' "$WT" | sha256sum | cut -c1-12`."""
+    return hashlib.sha256(wt.encode()).hexdigest()[:12]
+
+
+def vol_exists(vol):
+    return subprocess.run(["docker", "volume", "inspect", vol],
+                          capture_output=True).returncode == 0
+
+
+def vol_owner(vol):
+    """Записанный владелец тома, или None, если метки нет. Читается ИЗ КОНТЕЙНЕРА:
+    каталог тома на хосте может быть недоступен непривилегированному вызову, а с
+    самим томом инструмент работает всё равно только через docker."""
+    r = subprocess.run(
+        ["docker", "run", "--rm", "-v", f"{vol}:/target", IMAGE,
+         "sh", "-c", f"cat /target/{OWNER_STAMP} 2>/dev/null || true"],
+        capture_output=True, text=True)
+    owner = r.stdout.strip().splitlines()
+    return owner[0] if owner else None
+
+
+def stamp_owner(vol, wt):
+    subprocess.run(
+        ["docker", "run", "--rm", "-v", f"{vol}:/target", IMAGE,
+         "sh", "-c", f"printf '%s\\n' \"$1\" > /target/{OWNER_STAMP}",
+         "sh", wt],
+        capture_output=True)
+
+
+def target_volume(wt):
+    """Том цели сборки, выбранный по ВЛАДЕЛЬЦУ, а не по имени каталога.
+
+    Возвращает (имя тома, пояснение или None). Выходит с кодом 3 (отказ
+    инструмента), если даже том с хэшем пути занят чужим деревом."""
+    slug = volume_slug(wt)
+    tgt = f"fang-target-{slug}"
+    hashed = f"fang-target-{slug}{path_hash(wt)}"
+    note = None
+    if vol_exists(tgt):
+        owner = vol_owner(tgt)
+        if owner is None:
+            if os.environ.get("OFMUTATE_ADOPT_LEGACY_VOL") == "1":
+                note = f"том {tgt} без метки владельца занят по OFMUTATE_ADOPT_LEGACY_VOL=1"
+            else:
+                note = (f"том {tgt} существует без метки владельца — он мог быть набит "
+                        f"ЧУЖИМ деревом с тем же именем каталога, молча его не занимаю; "
+                        f"иду на {hashed} (первая сборка с нуля). Если том набивало "
+                        f"именно {wt} — OFMUTATE_ADOPT_LEGACY_VOL=1")
+                tgt = hashed
+        elif owner != wt:
+            note = f"том fang-target-{slug} принадлежит {owner}; беру {hashed}"
+            tgt = hashed
+    if tgt == hashed and vol_exists(hashed):
+        owner2 = vol_owner(hashed)
+        if owner2 is not None and owner2 != wt:
+            die(f"том {hashed} принадлежит {owner2}, а не {wt}. Это ОТКАЗ "
+                f"ИНСТРУМЕНТА, не дефект патча. Освободи: docker volume rm {hashed}", 3)
+    return tgt, note
+
+
 def test_module_ranges(text):
     """Диапазоны строк (1-based, включительно) модулей `#[cfg(test)]` в тексте файла.
     Скобки считаются грубо — построчно, без разбора строковых литералов; для
@@ -192,13 +273,16 @@ def split_hunks(wt, base, head):
     return out
 
 
-def run_tests(wt, crates, filt, label, logdir):
-    slug = volume_slug(wt)
-    tgt = f"fang-target-{slug}"
+def run_tests(wt, crates, filt, label, logdir, tgt=None):
+    if tgt is None:
+        tgt, note = target_volume(wt)
+        if note:
+            print(f"# ofmutate: {note}", file=sys.stderr)
     subprocess.run(["docker", "volume", "create", tgt],
                    capture_output=True, check=True)
     subprocess.run(["docker", "volume", "create", "fang-cargo-registry"],
                    capture_output=True, check=True)
+    stamp_owner(tgt, wt)
     pargs = " ".join(f"-p {c}" for c in crates) or "--workspace"
     cmd = f"{APT} cargo test {pargs} {filt}".strip()
     t0 = time.time()
@@ -328,8 +412,15 @@ def main():
     print(f"# логи: {logdir}")
     files = sorted({h["file"] for h in prod})
 
+    # Том выбирается ОДИН раз на весь прогон: оба этапа обязаны идти на одном и том
+    # же томе, иначе второй этап собирался бы с нуля и сравнивать было бы нечего.
+    tgt, note = target_volume(wt)
+    if note:
+        print(f"# ofmutate: {note}")
+    print(f"# том цели сборки: {tgt}")
+
     print("\n[1/2] как есть — обязано быть зелёным и непустым")
-    g = run_tests(wt, a.crate, a.test, "green", logdir)
+    g = run_tests(wt, a.crate, a.test, "green", logdir, tgt)
     show(g, "как есть")
     if g["verdict"] != "GREEN":
         print(f"\nОТКАЗ: с патчем тест не проходит ({g['verdict']}). "
@@ -344,7 +435,7 @@ def main():
     print(f"\n[2/2] продакшн-ханки откачены ({len(prod)} шт.) — обязано покраснеть")
     apply_reverse(wt, prod, logdir, "prod-revert")
     try:
-        r = run_tests(wt, a.crate, a.test, "red-all", logdir)
+        r = run_tests(wt, a.crate, a.test, "red-all", logdir, tgt)
     finally:
         ok = restore(wt, files)
     show(r, "без патча")
@@ -356,7 +447,8 @@ def main():
             apply_reverse(wt, [h], logdir, f"h{h['n']}-{os.path.basename(h['file'])}")
             try:
                 rr = run_tests(wt, a.crate, a.test,
-                               f"red-{h['file'].replace('/', '_')}-{h['n']}", logdir)
+                               f"red-{h['file'].replace('/', '_')}-{h['n']}",
+                               logdir, tgt)
             finally:
                 restore(wt, [h["file"]])
             show(rr, f"{h['file']} @@+{h['start']}")

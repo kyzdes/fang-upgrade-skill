@@ -123,10 +123,10 @@ find out cheaply is not to.
 
 ```bash
 docker exec <container> openfang auth list --json
-docker exec <container> openfang auth invite alice --name "Alice" --expires-hours 24
-docker exec <container> openfang auth revoke alice            # credential + sessions + invites
-docker exec <container> openfang auth revoke alice --delete   # and drop the slot
-docker exec <container> openfang auth reset-slot alice --output /path  # revoke + one new invite
+docker exec <container> openfang auth invite <slot> --name "<display name>" --expires-hours 24
+docker exec <container> openfang auth revoke <slot>            # credential + sessions + invites
+docker exec <container> openfang auth revoke <slot> --delete   # and drop the slot
+docker exec <container> openfang auth reset-slot <slot> --output /path  # revoke + one new invite
 ```
 
 `invite` creates the slot on demand — there is no fixed list of people — and prints
@@ -237,9 +237,12 @@ ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) — `is_operator_network` /
 `machine_key_allowed_here`, the 2026-08-22 change. The peer address comes from
 `ConnectInfo`; `X-Forwarded-For` is not read anywhere in that file, so a request through
 Traefik honestly looks like a request from Traefik and gets nothing. This is the same
-mechanism the "clearing `api_key` locks you out" trap already rests on — production's
-daemon sits at `172.19.0.2` and sees its gateway `172.19.0.1` as the peer
-(`docker inspect openfang-openfang-1`, 2026-08-23).
+mechanism the "clearing `api_key` locks you out" trap already rests on: the daemon sits
+at its own bridge address and sees **that network's gateway** as the peer. The gateway is
+whatever `docker inspect <container>` reports for the network the container is on — a
+compose-created network and the default `bridge` have different ones, so read it rather
+than copy a number (measured 2026-08-24: `172.19.0.1` for a compose network,
+`172.17.0.1` on the default bridge).
 
 The trap is that **a loopback published Docker port is not loopback.** Docker's userland
 proxy rewrites the source to the bridge gateway, while a port published on the tailnet
@@ -680,8 +683,10 @@ someone who was not there.
   `HYPERFUSION_API_KEY` and `/data/config.toml` returns the key itself — verified live. All 65 tools
   are exposed. Only `shell_exec` is approval-gated, and if approved it skips `safe_bins` entirely.
 - Clearing `api_key` on Docker **locks you out**, it does not open the box: the container always sees
-  the bridge gateway (172.19.0.1) as the peer, so the loopback exemption never applies — and all
-  external clients then share one 500-token/min rate-limit bucket.
+  the gateway of its own bridge network as the peer — never `127.0.0.1` — so the loopback exemption
+  never applies, and all external clients then share one 500-token/min rate-limit bucket. The gateway
+  address differs per network (`docker inspect <container>`), so it is the *mechanism* that always
+  holds, not the number.
 - `openfang security verify` prints `✘ Audit trail integrity check FAILED` when the real problem is
   the missing header. `openfang config show` prints `api_key` in plaintext.
 
@@ -750,20 +755,24 @@ someone who was not there.
 
 Don't rewrite these from scratch — they are known-good and already ran on this box. Everything in
 `scripts/` is POSIX `sh` or python3 stdlib, takes `--help`, and honours `OPENFANG_URL` /
-`OPENFANG_HOME_HOST` / `OPENFANG_CONTAINER` / `OPENFANG_API_KEY`.
+`OPENFANG_HOME_HOST` / `OPENFANG_CONTAINER` / `OPENFANG_API_KEY`. **None of them carries a default
+target any more:** `OPENFANG_HOME_HOST` and `OPENFANG_CONTAINER` are resolved in one place
+(`scripts/oftarget.py`), which discovers the running OpenFang container and exits 2 rather than
+guess when there is not exactly one. Run `oftarget.py show` to see what a tool would act on.
 
 | Path | What it is |
 |---|---|
+| `scripts/oftarget.py` | Answers "which install is this tool about to act on?" for `ofctl`, `ofdoctor`, `ofhand`, `ofcron` and `ofbackup`. `OPENFANG_CONTAINER` set → that is the target; unset → discovered from the running containers, and **exit 2 with the candidates listed** when that is not exactly one. `OPENFANG_HOME_HOST` unset → read off the chosen container's own mount table, so it cannot name a different install than the container being restarted. `oftarget.py show` prints both and how each was decided. |
 | `scripts/ofctl` | One-line authenticated API calls. Reads the top-level `api_key` with awk that stops at the first `[table]`, and keeps it out of `ps` and shell history. `-x` extracts one field, `-n` sends no credential so you can prove a route is public, `-t` raises the timeout for workflow runs. |
 | `scripts/ofdoctor` | Read-only preflight: key, auth enforcement, provider registration, model resolution and pricing, the #1195 prefix collision, **secrets appearing in unauthenticated responses**, cron credential leaks and failure counts, hands on disk that never loaded, container binaries, file modes. `--full` also runs the real `openfang doctor` and explains why its `✘ No LLM provider API keys found!` is a false alarm here. |
 | `scripts/ofhand` | `lint` / `install` / `activate` / `set` / `list`. Install = copy + restart + prove it loaded. No `deactivate`, because that deletes the hand's cron jobs. |
 | `scripts/ofcron` | Create / list / enable / disable / run / rm, validating locally everything the API 400s on and resolving agent names to UUIDs. |
 | `scripts/ofbackup` | WAL-safe snapshot via SQLite's backup API + state tarball + a restore that strips stale `-wal`/`-shm`. |
-| `scripts/ofcheck-rs` | `cargo check`/`clippy` for a **fork source worktree**, run inside a container — no Rust toolchain needed on the host. `ofcheck-rs <worktree-path> [crate...]`. The build-target Docker volume is named `fang-target-$(basename <worktree>)-` (`ofcheck-rs:21-22`) — **by directory name only**, so two worktrees whose directories share a name still share a volume and cargo can replay one tree's fingerprint for the other. `ofgate` fixed this with an owner marker; `ofcheck-rs` and `ofmutate` did not. First check per worktree is ~4.5 min, then incremental; a build target runs 5-12 GB, so free ≥12G before running it and `docker volume rm fang-target-<slug>` after a patch lands. For patching `/root/src/openfang` itself, not for operating the running instance. |
+| `scripts/ofcheck-rs` | `cargo check`/`clippy` for a **fork source worktree**, run inside a container — no Rust toolchain needed on the host. `ofcheck-rs <worktree-path> [crate...]`. The build-target Docker volume is named `fang-target-$(basename <worktree>)-` (`ofcheck-rs:21-22`) — **by directory name only**, so two worktrees whose directories share a name still share a volume and cargo can replay one tree's fingerprint for the other. `ofgate` fixed this with an owner marker and `ofmutate` now honours the same marker; `ofcheck-rs` still does not, so a volume it leaves behind carries no owner and the other two will not adopt it silently. First check per worktree is ~4.5 min, then incremental; a build target runs 5-12 GB, so free ≥12G before running it and `docker volume rm fang-target-<slug>` after a patch lands. For patching `/root/src/openfang` itself, not for operating the running instance. |
 | `scripts/ofgate` | Runs the **three cargo commands** of Fork CI's `check` job, in CI's order, in a container: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -- --test-threads=2` — and nothing else from the workflow: not the "toolchain versions agree in all four places" step, not the Tauri system-dep install, not the `image` job that builds the Dockerfile. Use it to fail fast before pushing and save CI round trips. **It is not proof of anything.** Its verdict block is self-signed with no key, and it can print GREEN without compiling: the build-target volume is keyed to the worktree path, so a tree redeployed at that path by `cp -a` / `rsync -a` / `git archive \| tar -x` / `docker cp` keeps mtimes cargo considers fresh. Reproduced twice; `scripts/README.md` carries the transcript and the workaround (delete the volume, or use a never-used worktree path). What counts as done is a green CI run: `gh run view -R kyzdes/fang-upgrade <id> --json status,conclusion,headSha`. |
-| `scripts/ofmutate` | Mechanical red-before-green for a fork patch: `ofmutate <worktree> --test <filter> -p <crate>`. Runs the filtered test as committed (must be green **and** non-empty), reverse-applies only the patch's *production* hunks — Rust unit tests sit in the same file under `#[cfg(test)]`, so reverting whole files would delete the test along with the fix and prove nothing — then requires red, then restores the tree. `ДОКАЗАНО (RED-ASSERT)` is proof; `СЛАБОЕ КРАСНОЕ (RED-COMPILE)` only proves the test knows the new API, not that it checks its behaviour; `ТАВТОЛОГИЯ` (exit 1) and the `passed=0` refusal (exit 4, filter matched nothing) mean there is effectively no test. Refuses a dirty worktree (exit 2) and <12 GB free (exit 3 — the tool declining, **not** a patch defect). Shares `ofcheck-rs`'s build volume, so runs stay incremental: measured 203 s cold / 35 s warm on `openfang-runtime` — and inherits its unsafe naming (`volume_slug()` is `basename` and nothing else, `ofmutate:73-76`), so run it from a uniquely named worktree. On its first real use it found a tautology in an existing fork patch (`fix/file-read-truncation`: `test_file_read_full_file_no_truncation_marker` passes with the fix reverted). |
+| `scripts/ofmutate` | Mechanical red-before-green for a fork patch: `ofmutate <worktree> --test <filter> -p <crate>`. Runs the filtered test as committed (must be green **and** non-empty), reverse-applies only the patch's *production* hunks — Rust unit tests sit in the same file under `#[cfg(test)]`, so reverting whole files would delete the test along with the fix and prove nothing — then requires red, then restores the tree. `ДОКАЗАНО (RED-ASSERT)` is proof; `СЛАБОЕ КРАСНОЕ (RED-COMPILE)` only proves the test knows the new API, not that it checks its behaviour; `ТАВТОЛОГИЯ` (exit 1) and the `passed=0` refusal (exit 4, filter matched nothing) mean there is effectively no test. Refuses a dirty worktree (exit 2) and <12 GB free (exit 3 — the tool declining, **not** a patch defect). Build volume chosen by **owner**, not by directory name (`target_volume()`, `ofmutate:178`): the same `.ofgate-owner` marker `ofgate` writes (`ofmutate:68`, `ofgate:82`) and the same hashed fallback (`ofmutate:147`, `ofgate:185`), so one tree keeps its warm volume and two trees with the same directory name never share one. Reproduced before the fix on two trees both called `twin`: the second got `GREEN passed=1` in 0.07 s from the first's test binary while its own code fails the test; after the fix it goes to `fang-target-twin-<hash>` and returns `RED-ASSERT`. An unmarked volume (one `ofcheck-rs` left) is not adopted silently — `OFMUTATE_ADOPT_LEGACY_VOL=1` does that deliberately. Runs stay incremental: measured 203 s cold / 35 s warm on `openfang-runtime`. On its first real use it found a tautology in an existing fork patch (`fix/file-read-truncation`: `test_file_read_full_file_no_truncation_marker` passes with the fix reverted). |
 | `scripts/ofledger` | Rolls up the workflow journals of many runs: the per-run "не проверял" lists, what repeats across runs, and a done/error/retry/token summary per agent. Exit 0 only when it found something to report on **two or more** runs; exit 2 on a single-run directory, so a lone run cannot be dressed up as a trend. |
-| `scripts/ofscrub` | Greps this skill's tree for text that names **one particular install** — the deployment's domain, its retired host name, its public IPv4, a literal tailnet address where `<tailnet-ip>` belongs, a `*.ts.net` name, a passkey slot name, a literal `rp_id`/`rp_origin`. Reports only, never edits; skips `.git/`, `__pycache__/` and its own source (the rules quote the strings they hunt for). Exit 0 clean · 1 hit · 2 bad args. This is what makes `README.md`'s "substitute your own" a checkable promise rather than a wish. |
+| `scripts/ofscrub` | Checks that this tree keeps `README.md`'s placeholder promise, by **shape rather than by a list of names** — carrying the names would publish them, and a hashed list of short guessable names with published lengths was broken by dictionary in under a second. Two legs: a literal that designates one machine whoever owns it (an IP that is `is_global` and not multicast, a Tailscale carrier-NAT address, a `*.ts.net` name), and a value standing in a key whose content *is* the install's identity (`rp_id`, `rp_origin`, an `rp` object's `id`, `slot`, an `openfang auth invite\|revoke\|reset-slot` argument, `OPENFANG_URL`) unless it is a `<placeholder>`, empty or an RFC 2606/6761 documentation name. Reports **file and line only** — printing the line would republish what it exists to remove. Scans its own source like every other file: no self-exemption. Exit 0 clean · 1 hit · 2 bad args. What it cannot see (a bare domain in prose, a container name) is written in its own header. |
 | `scripts/ytwatch.py` | Channel listing + caption fetch (no video download) + `seen.json` dedup. Written as a file precisely because `shell_exec` rejects pipes and redirection. Install: `docker exec openfang-openfang-1 mkdir -p /data/workspaces/<agent>/bin` then `docker cp ~/.claude/skills/fang-upgrade/scripts/ytwatch.py openfang-openfang-1:/data/workspaces/<agent>/bin/` (needs `pip3 install --break-system-packages yt-dlp` in the container). |
 | `scripts/rtwatch.py` | RuTube sibling of `ytwatch.py`, same design (flat argv, one JSON object per call, `seen.json` dedup) but not a drop-in: no RSS feed (uses `yt-dlp --flat-playlist`), subtitles are `srt` under `subtitles` not `automatic_captions` (`--write-subs`, not `--write-auto-subs`), and video ids are 32-char hex, not 11-char base64. Same install pattern as `ytwatch.py`, different filename. |
 | `assets/youtube-insights-hand/` | A complete working `HAND.toml` + `SKILL.md`. Start any new hand by copying this, not from a blank file. Install: `ofhand install ~/.claude/skills/fang-upgrade/assets/youtube-insights-hand`. `assets/README.md` covers the manual host-volume copy, why `docker cp <dir> …:/data/hands/<id>` silently nests and reloads the old definition, and the fact that the deployed copy still carries the unreachable `timeout_seconds: 240`. |

@@ -24,11 +24,33 @@ import sys
 import urllib.error
 import urllib.request
 
-HOME_HOST = os.environ.get(
-    "OPENFANG_HOME_HOST", "/var/lib/docker/volumes/openfang_openfang-data/_data"
-)
+TOOL = "ofdoctor"
+# --- which install are we about to act on? -----------------------------------
+# The answer used to be a constant naming one particular deployment. It is now
+# derived and refused when ambiguous — see scripts/oftarget.py for why.
+import importlib.util as _ilu
+
+_spec = _ilu.spec_from_file_location(
+    "oftarget", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "oftarget.py"))
+oftarget = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(oftarget)
+_HELP_ONLY = any(a in ("-h", "--help") for a in sys.argv[1:])
+
+
+def _refuse(exc):
+    print(f"{TOOL}: {exc}", file=sys.stderr)
+    sys.exit(2)
+
 BASE_URL = os.environ.get("OPENFANG_URL", "http://127.0.0.1:4200").rstrip("/")
-CONTAINER = os.environ.get("OPENFANG_CONTAINER", "openfang-openfang-1")
+try:
+    CONTAINER, WHY_CONTAINER = oftarget.container()
+    HOME_HOST, WHY_HOME = oftarget.home_host(CONTAINER)
+except oftarget.Refused as _exc:
+    if not _HELP_ONLY:
+        _refuse(_exc)
+    CONTAINER = HOME_HOST = None
+    WHY_CONTAINER = WHY_HOME = "not resolved (--help)"
 
 # Paths worth probing without credentials. In passkey mode all but health should
 # return 401; the scan still inspects any accidental 200 body for known secrets.

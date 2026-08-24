@@ -778,25 +778,25 @@ Supports `?level=` and `?filter=` query filters.
 
 ### 10.5 Auth model
 
-Two independent mechanisms, both handled by one middleware (`openfang-api/src/middleware.rs:71`):
+Two mechanisms in stock v0.6.9, of which this fork keeps one — both handled by one middleware (`openfang-api/src/middleware.rs:71`):
 
 1. **Top-level `api_key` → Bearer.** Accepted as `Authorization: Bearer <key>`, `X-API-Key: <key>`,
    or `?token=<urlencoded key>` (for EventSource/WebSocket clients). Compared with
    `subtle::ConstantTimeEq` after a length check.
-2. **`[auth]` dashboard login.** `POST /api/auth/login {username,password}` →
-   constant-time username compare + `argon2::Argon2::default().verify_password` against
-   `password_hash`; on success issues `openfang_session=<token>; Path=/; HttpOnly; SameSite=Strict; Max-Age=<ttl>`
-   and also returns the token in the JSON body. Token format
-   `base64("<username>:<expiry_unix>:<hmac_sha256_hex>")` (`session_auth.rs:10-18`), verified with a
-   constant-time compare and an expiry check. **Session secret = `api_key` if non-empty, else
-   `password_hash`** (`server.rs:147-155`, mirrored in `routes.rs:12856-12862` and `ws.rs:328-335`).
-   Both login outcomes are written to the audit chain as `AuthAttempt`.
+2. **`[auth]` dashboard login — GONE FROM THIS FORK.** Stock v0.6.9 had a username/password login
+   backed by an `openfang-api/src/session_auth.rs` module. Commit `5cd4234`
+   ("feat(auth): passkey login for the dashboard") deleted it; passkey enrolment (§`SKILL.md`
+   "Passkey") replaced it whole. Checked by a run rather than from memory:
 
-`openfang auth hash-password` (`main.rs:6294-6314`) prompts twice, calls
-`openfang_api::session_auth::hash_password` → `Argon2::default()` (Argon2id, v19, m=19456, t=2, p=1)
-with a random `SaltString`, and prints a ready-to-paste `[auth]` block. `verify_password` parses
-the PHC string; a legacy SHA-256 hex hash is rejected outright, and `server.rs:111-118` logs a
-startup warning if `enabled && !password_hash.starts_with("$argon2")`.
+       $ grep -rn "session_auth" --include='*.rs' crates | wc -l
+       0
+       $ grep -rn "password_hash" --include='*.rs' crates/openfang-api/src/server.rs \
+             crates/openfang-api/src/routes.rs | wc -l
+       0
+
+   Everything this section used to say about `password_hash`, `openfang auth hash-password` and the
+   `openfang_session` cookie described code that is not in the tree, so it is deleted rather than
+   rewritten. The passkey path that replaced it is documented in `SKILL.md`, not here.
 
 Fail-closed rule (`middleware.rs:197-212`, issue #1034): if `api_key` is empty **and**
 `[auth].enabled == false`, only loopback peers (`ConnectInfo` IP `is_loopback()`, default-deny when
@@ -901,13 +901,23 @@ audit chain**. The real problem is the unauthenticated GET, not the method gap.
 ### 10.6d On Docker, an empty `api_key` locks you OUT — it does not open the daemon up
 
 `is_loopback` is derived from `ConnectInfo` (`middleware.rs:79-83`), and inside the container the
-peer is always the bridge gateway. Verified by decoding `/proc/net/tcp` inside the container during a
-host-side `curl http://127.0.0.1:4200`: the peer was **172.19.0.1**, not 127.0.0.1. So the
-`api_key.is_empty() && !auth_enabled` branch (`middleware.rs:197-212`) takes the *non*-loopback path
-and 401s everything non-public. Two consequences:
+peer is always the gateway of the container's own bridge network — never `127.0.0.1`. Verified by
+decoding `/proc/net/tcp` inside the container while a host-side connection to the published port was
+open. Measured twice, on two containers of the same image on two different bridge networks:
+
+| container's network | container address | peer the daemon saw | measured |
+|---|---|---|---|
+| compose-created network | `172.19.0.2` | `172.19.0.1` | 2026-08-23 |
+| default `bridge` | `172.17.0.2` | `172.17.0.1` | 2026-08-24 |
+
+Both are that network's gateway, as `docker inspect <container>` reports it. **The mechanism is what
+generalises; the number is per-network, so read it off your own container rather than copying one
+from here.** Either way the `api_key.is_empty() && !auth_enabled` branch (`middleware.rs:197-212`)
+takes the *non*-loopback path and 401s everything non-public. Two consequences:
 
 - Clearing `api_key` in a Docker deployment breaks the API rather than opening it.
-- Every external client shares **one** GCRA bucket keyed on `172.19.0.1` (500 tokens/minute, §10.7).
+- Every external client shares **one** GCRA bucket keyed on that single gateway address
+  (500 tokens/minute, §10.7).
 
 ### 10.7 Rate limiting, CORS, headers
 
@@ -1008,7 +1018,8 @@ again — a classic TOCTOU/DNS-rebinding window. Also `mcp.rs:329` has a *second
    `auth_header` bearer token you put in a webhook target (§10.6b — reproduced on this box before
    the job was deleted; `cron_jobs.json` is `[]` today).
 8c. **Clearing `api_key` on a Docker deployment fails closed, not open** (§10.6d): the container
-   always sees the bridge gateway (172.19.0.1) as the peer, so the loopback exemption never applies.
+   always sees the gateway of its own bridge network as the peer — never `127.0.0.1` — so the
+   loopback exemption never applies. The gateway address is per-network, not a constant (§10.6d).
 9. **`api_key = ""` + `[auth] enabled = true` ⇒ empty `X-API-Key`/`?token=` authenticates
    everything, including writes** (§10.6).
 10. **LLM `agent_spawn` skips `validate_capability_inheritance`** (§3.5) while `/api/security`

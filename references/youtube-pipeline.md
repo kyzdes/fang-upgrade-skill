@@ -289,8 +289,8 @@ Root cause, verified inside the container:
 docker exec openfang-openfang-1 python3 -c "
 import socket
 for f in socket.getaddrinfo('www.youtube.com', 443, proto=socket.IPPROTO_TCP): print(f[0], f[4])"
-# 2  ('142.251.156.4', 443)   ... eight A records
-# 10 ('2001:4860:4827:400::', 443, 0, 0)   ... eight AAAA records
+# 2  ('<A-record>', 443)          ... eight A records
+# 10 ('<AAAA-record>', 443, 0, 0)   ... eight AAAA records
 
 docker exec openfang-openfang-1 cat /proc/net/if_inet6
 # 00000000000000000000000000000001 01 80 10 80  lo      <- ::1 only, no route

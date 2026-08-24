@@ -20,31 +20,79 @@ Put them on `$PATH` once per session, or call them by absolute path:
 
     export PATH="$HOME/.claude/skills/fang-upgrade/scripts:$PATH"
 
-The five API tools can be pointed at a second instance or a scratch directory, but **not
-all of them read the same variables**, and an earlier revision of this file claimed they
-did. What each script actually references, read out of the scripts with
-`grep -q <VAR> <script>` on 2026-08-23:
+The five API tools can be pointed at a second instance or a scratch directory. They no
+longer disagree about how: `OPENFANG_HOME_HOST` and `OPENFANG_CONTAINER` are read in one
+place, `scripts/oftarget.py`, and every tool goes through it. Read out of the scripts on
+2026-08-24:
 
 | | `OPENFANG_URL` | `OPENFANG_CONFIG` | `OPENFANG_API_KEY` | `OPENFANG_HOME_HOST` | `OPENFANG_CONTAINER` |
 |---|---|---|---|---|---|
-| `ofctl` | yes | yes | yes | **no** | **no** |
-| `ofdoctor` | yes | yes | **no** | yes | yes |
-| `ofhand` | yes | yes | yes | yes | yes |
-| `ofcron` | yes | yes | yes | yes | **no** |
-| `ofbackup` | **no** | **no** | **no** | yes | yes |
+| `ofctl` | yes | yes | yes | via `oftarget.py` | via `oftarget.py` |
+| `ofdoctor` | yes | yes | **no** | via `oftarget.py` | via `oftarget.py` |
+| `ofhand` | yes | yes | yes | via `oftarget.py` | via `oftarget.py` |
+| `ofcron` | yes | yes | yes | via `oftarget.py` | via `oftarget.py` |
+| `ofbackup` | **no** | **no** | **no** | via `oftarget.py` | via `oftarget.py` |
 
-The gap bites in practice: pointing `ofctl` at the staging instance with
-`OPENFANG_HOME_HOST` leaves it reading **production's** `config.toml` and sending
-production's key to staging. Measured:
+That closes a gap this file used to record as unfixed: pointing `ofctl` at the staging
+instance with `OPENFANG_HOME_HOST` left it reading the *other* install's `config.toml` and
+sending that key to staging. Both runs below are on the same box, same command:
 
     $ OPENFANG_URL=http://127.0.0.1:4201 \
       OPENFANG_HOME_HOST=/var/lib/docker/volumes/openfang-staging-data/_data \
       ofctl --show-key-source
-    source: /var/lib/docker/volumes/openfang_openfang-data/_data/config.toml (top-level api_key)
+    # before: source: /var/lib/docker/volumes/openfang_openfang-data/_data/config.toml (top-level api_key)
+    # after:  source: /var/lib/docker/volumes/openfang-staging-data/_data/config.toml (top-level api_key)
 
-`ofctl` takes `OPENFANG_CONFIG` for that; with it the source line names the staging file.
-`ofcheck-rs` is unrelated to the OpenFang API and ignores all of them — it only takes a
-worktree path and optional crate names.
+`ofcheck-rs`, `ofgate` and `ofmutate` are unrelated to the OpenFang API and ignore all of
+these — they take a worktree path.
+
+## `oftarget.py` — which install is this tool about to act on?
+
+    oftarget.py container   # the container name, or a refusal
+    oftarget.py home        # the host path of its data volume, or a refusal
+    oftarget.py show        # both, with how each was decided
+
+`ofdoctor`, `ofhand`, `ofcron`, `ofbackup` and `ofctl` used to carry a built-in default
+target: a container name and a volume path. Those are not exotic strings — they are exactly
+what `docker compose` derives from the upstream compose file (project `openfang`, service
+`openfang`, volume `openfang-data`), so every reader of the quick start has a container by
+that name if they have one at all. The tools restart containers and write into data
+volumes; the default meant a stranger acted on whichever install answered to the name, and
+anybody running a staging box beside a live one silently got the live one. Protocol rule 5
+— prove the target before a destructive action, and check the name you act under — was
+being broken by a constant.
+
+The replacement does not pick a better name, it stops picking:
+
+1. `OPENFANG_CONTAINER` set → that is the target; naming it is the proof.
+2. unset → look at the running containers, keep the ones that are recognisably OpenFang
+   (project name in the container name or the image reference — deliberately loose, since a
+   false candidate produces a refusal that lists it, never a silent wrong target). Exactly
+   one → use it and say so. Zero or several → exit 2 and list what was seen.
+3. `OPENFANG_HOME_HOST` set → that is the data directory.
+4. unset → read it off the chosen container's own mount table, so it cannot name a
+   different install than the container about to be restarted.
+
+Measured on a box running two of them:
+
+    $ ofdoctor
+    ofdoctor: 2 running containers look like OpenFang daemons, so the target is ambiguous
+    and nothing will be guessed:
+        <container A>   (<image>)
+        <container B>   (<image>)
+    Name the one you mean:
+        OPENFANG_CONTAINER=<container> <tool> ...
+    $ echo $?
+    2
+
+    $ OPENFANG_CONTAINER=<container B> oftarget.py show
+    container    <container B>
+      decided by OPENFANG_CONTAINER
+    home on host /var/lib/docker/volumes/<container B>-data/_data
+      decided by mount table of <container B> (/data)
+
+`--help` still works with no install present at all, and `ofctl` with `OPENFANG_API_KEY`
+set never calls docker: it has no reason to open a config file.
 
 ## `ofctl` — authenticated API calls
 
@@ -238,19 +286,37 @@ uncommitted work — and refuses below 12 GB free (exit 3, same threshold as
 misreading cost two debugging rounds over the fork sprints. Override the threshold
 only to exercise that branch: `OFMUTATE_DISK_MIN_G=999 ofmutate …`.
 
-Runs in the same container and on the same `fang-target-<slug>` build volume as
-`ofcheck-rs`, deliberately reproducing that script's volume name character for
-character (including the trailing `-` that `tr` leaves from `basename`'s newline),
-so builds stay incremental and no extra disk is consumed. Measured on
-`crates/openfang-runtime`: 203 s cold for the first run, 35 s for the second.
+Runs in a container on a `fang-target-<slug>` build volume, so builds stay incremental and
+no extra disk is consumed. Measured on `crates/openfang-runtime`: 203 s cold for the first
+run, 35 s for the second.
 
-**That name is the old, unsafe scheme, and `ofmutate` still uses it.** `volume_slug()`
-(`ofmutate:73-76`) is `basename` and nothing else — no owner marker, no path hash — which
-is precisely the naming `ofgate` had to abandon because two trees whose directories share a
-name share a build volume and one silently returns the other's result (`ofgate`'s section,
-"Build target isolation"). Two worktrees called `.../twin` collide here today. Until this is
-fixed, run `ofmutate` from a uniquely named worktree, or `docker volume rm
-fang-target-<basename>-` first.
+**The volume is now chosen by owner, not by directory name** (`target_volume()`,
+`ofmutate:178`), using the same `.ofgate-owner` marker `ofgate` writes (`ofmutate:68`,
+`ofgate:82`) and the same hashed fallback name (`ofmutate:147`, `ofgate:185`). The marker
+describes the *volume*, not the tool, so the two tools share a warm volume for one tree and
+never share one between two.
+
+That this mattered is not a hypothesis. Two trees whose directories are both named `twin`,
+with different code — tree A's test passes, tree B's must fail:
+
+    # before the fix
+    A  volume fang-target-twin-   GREEN passed=1   Compiling twin v0.1.0 (/build)  0.85s
+    B  volume fang-target-twin-   GREEN passed=1   Finished in 0.07s   (nothing compiled)
+       both ran the SAME test binary, twin-62218c97741a28ad
+    # B on a volume of its own, which is what B's code actually does:
+       FAILED. 0 passed; 1 failed   assertion `left == right` failed: -1 vs 42
+
+    # after the fix
+    A  volume fang-target-twin-               GREEN      passed=1
+    B  ofmutate: том fang-target-twin- принадлежит /root/ofmfix-twinA/twin;
+       беру fang-target-twin-ad378dd327d2
+    B  volume fang-target-twin-ad378dd327d2   RED-ASSERT passed=0 failed=1
+
+`ofcheck-rs` still names its volume by `basename` alone (`ofcheck-rs:21-22`) and writes no
+marker, so a volume left behind by it has no owner. `ofmutate` will **not** adopt an
+unmarked volume silently — it moves to the hashed name and says so; adopt it deliberately
+with `OFMUTATE_ADOPT_LEGACY_VOL=1`. If even the hashed volume belongs to another tree,
+`ofmutate` exits 3 (tool refusal, not a patch defect).
 
 ## `ytwatch.py` — YouTube intake, runs *inside* the container
 
@@ -858,39 +924,88 @@ arguments — never a quiet empty success.
     ofscrub <dir>           # scan another tree (a git worktree, a release tarball)
     ofscrub --list          # print the rules and exit 0
 
-`README.md` promises that "addresses and host names appear as `<tailnet-ip>`,
-`<public-ip>`, `<tailnet-host>`". Nothing enforced it, and it was broken twice by hand —
-a tailnet address landed in `SKILL.md`'s peer-source table and in this file's `ofctl`
-section, and a relying-party domain plus a live passkey slot name landed in `SKILL.md`'s
-passkey section. This repo is public.
+`README.md` promises that addresses and host names appear as `<tailnet-ip>`, `<public-ip>`,
+`<tailnet-host>`, the passkey relying party as `<rp-host>` and a passkey slot as `<slot>`.
+Nothing enforced it, and it was broken by hand twice. This repo is public.
 
-`ofscrub` greps for the classes of text that name **one particular install** rather than
-any install: the deployment's public domain, its retired host name, its public IPv4, a
-literal Tailscale CGNAT address where `<tailnet-ip>` belongs, a `*.ts.net` MagicDNS name,
-a passkey slot name printed as a value, and a literal `rp_id`/`rp_origin`. Reserved
-example domains (`.example`, `.invalid`, `.test`), the `100.64.0.0/10` range itself and
-Tailscale's fixed `100.100.100.200` resolver are forgiven by rule, not by hand.
+**It checks shapes, not a list of names, and that is a decision with a history.** Three
+earlier versions carried the leaked strings — first as plain text, then as
+`(length, FNV-1a, SHA-256)` triples with a docstring claiming the names could not be read
+back. They could: a 1603-word dictionary recovered all four in a fraction of a second,
+because an unsalted digest of a short guessable string with its length published is a
+dictionary attack and not a secret. A public file cannot hold a secret salt. So the guard
+stopped asking *whose* a value is:
 
-It reports and never edits. `.git/`, `__pycache__/`, binary files and **its own source**
-are skipped — the rule table contains the strings it hunts for, so scanning itself would
-always hit. That is the entire exemption, and it is printed on every run.
+- **the value's shape** — an IP literal that is globally routable designates exactly one
+  host on the public internet, whoever owns it; an address in Tailscale's carrier-NAT range
+  designates one node of one tailnet; a name under `.ts.net` is minted per tailnet. The
+  innocent/guilty line is `ipaddress.ip_address(x).is_global` minus multicast — IANA's list
+  of special-purpose ranges as the standard library maintains it, so loopback, RFC 1918, the
+  RFC 5737/3849 documentation ranges and the benchmark range pass without being enumerated
+  here. `100.64.0.0/10` written as a range and Tailscale's fixed `100.100.100.200` resolver
+  are forgiven: neither designates a host.
+- **the slot's shape** — a relying-party host or a passkey slot name is an ordinary word;
+  what gives it away is the key it is assigned to. A value in `rp_id`, `rp_origin`, the `id`
+  of a WebAuthn `rp` object, a `slot`, an `openfang auth invite|revoke|reset-slot` argument
+  or `OPENFANG_URL` **is** the install's identity by definition of the key. Forgiven only
+  when it is a `<placeholder>`, empty, an RFC 2606/6761 documentation name, or an address
+  the first leg already calls innocent. The file holds a list of KEYS, never of values.
 
-Exit 0 clean · 1 at least one hit · 2 bad arguments. That it can actually go red was shown
-against this repo's own published tree rather than a canary (the found strings are redacted
-in the transcript below, for the obvious reason):
+What it cannot see is stated in its own header rather than left for a reader to discover: a
+bare domain in prose (`moone.dev`, `github.com` and `northwind-lab.io` are one shape), a
+container or volume name, and an unstructured secret — that last one is `ofdoctor`'s job.
 
-    $ git worktree add --detach /tmp/head HEAD          # 73cb6c6, before this change
-    $ ofscrub /tmp/head ; echo $?
-    HIT  public domain of this install
-           SKILL.md:86:rp_id             = "<the domain>"       # bare host, no scheme, no port
-           … 4 more
-    HIT  tailnet address literal (must be <tailnet-ip>)
-           SKILL.md:215 SKILL.md:217 scripts/README.md:75 scripts/README.md:81
-    HIT  passkey slot name printed literally
-    HIT  relying-party id printed literally
-    HIT  relying-party origin printed literally
-    ofscrub: FAIL — the placeholder promise in README.md is not true right now
+**It scans its own source like every other file.** No `--exclude`, no self-exemption. The
+rules describe shapes, so they do not contain the shapes they describe; needing an exemption
+would be evidence it was still carrying a list. Proved by planting a foreign install's
+values inside `ofscrub` itself:
+
+    $ printf '# rp_id = "<a foreign host>"  and  <a foreign public IPv4>\n' >> copy/ofscrub
+    #   ...with the two placeholders replaced by real values of an install that is
+    #   not this one. They are not printed here for the same reason the tool does
+    #   not print them: this file is scanned by the tool it documents.
+    $ python3 copy/ofscrub copy
+    HIT  globally routable IP literal (must be <public-ip>)
+           ofscrub:287
+    HIT  identity slot holding a real value (must be <rp-host> / <slot>)
+           ofscrub:287
     1
-    $ ofscrub ; echo $?          # the same tree with this change applied
+
+**A hit is reported by file and line only.** The previous version printed the matching line
+in full, so its own report republished the string it exists to keep out of the tree — and
+reports get pasted into issues and chat. A path and a line number are everything to whoever
+holds the tree and nothing to whoever does not.
+
+Exit 0 clean · 1 at least one hit · 2 bad arguments. Red-before-green, on a canary holding
+five values of an install that is not this one, in the shapes the old rules had no rule for
+(JSON `rp_id`, a slot name as a command argument, a public IPv4, a public IPv6):
+
+    $ sh old-ofscrub canary ; echo $?          # every rule the old version had
+    ok   public domain of this install
+    ok   retired host name
+    ok   public IPv4 of this host
+    ok   tailnet address literal (must be <tailnet-ip>)
+    ok   MagicDNS host name (must be <tailnet-host>)
+    ok   passkey slot name printed literally
+    ok   relying-party id printed literally
+    ok   relying-party origin printed literally
+    ofscrub: clean
+    0
+    $ python3 ofscrub canary ; echo $?         # the same file, this version
+    HIT  globally routable IP literal (must be <public-ip>)
+           planted.md:4
+           planted.md:5
+    HIT  identity slot holding a real value (must be <rp-host> / <slot>)
+           planted.md:1
+           planted.md:2
+           planted.md:3
+    1
+
+and green on a canary of legitimate text — loopback, the docker bridges, RFC 1918, the
+RFC 5737/3849 documentation ranges, multicast and broadcast, `100.64.0.0/10`,
+`100.100.100.200`, `rp_id = "rp.example"`, `rp_id = ""`, `"slot": "<slot>"`,
+`OPENFANG_URL=http://127.0.0.1:4200`, `github.com` and a version number `0.6.9`:
+
+    $ python3 ofscrub legit-canary ; echo $?
     ofscrub: clean
     0
