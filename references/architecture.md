@@ -573,7 +573,7 @@ loopback.
 counts, and subsystem status." The route handler's own doc-comment
 (`crates/openfang-api/src/routes.rs:3494`, `"/// GET /api/health/detail — Full
 health diagnostics (requires auth)."`) makes the same claim. **Both are wrong.**
-`middleware.rs:103-104` explicitly lists `path == "/api/health/detail"` alongside
+`middleware.rs:151` explicitly lists `path == "/api/health/detail"` alongside
 `/api/health` in the `is_public` boolean — no auth is enforced on it. Confirmed live
 against the running container, which **has** a non-empty `api_key` configured:
 
@@ -588,7 +588,7 @@ No `Authorization` header was sent. This leaks agent count, uptime, restart/pani
 counters, and any config validation warnings to anyone who can reach the port —
 worth knowing before exposing `api_listen` beyond loopback even with an `api_key` set.
 
-Also worth noting from the same `is_public` list (`middleware.rs:98-140`): a long
+Also worth noting from the same `is_public` list (`middleware.rs:145-182`): a long
 list of **GET-only** dashboard read endpoints are public by design so the SPA can
 render before a key is entered — `/api/agents`, `/api/models`, `/api/providers`,
 `/api/budget*`, `/api/channels`, `/api/hands*`, `/api/skills`, `/api/sessions`,
@@ -713,7 +713,7 @@ for the task board.
 - `/api/health/detail` is **publicly readable with no auth** in v0.6.9 despite both
   `docs/architecture.md` and the route's own doc-comment claiming otherwise —
   verified live against the running container even with `api_key` configured
-  (`middleware.rs:103-104` vs. `routes.rs:3494`).
+  (`middleware.rs:151` vs. `routes.rs:3494`).
 - `read_api_key()` (`openfang-cli/src/main.rs:1621`) checks `config.toml` before `OPENFANG_API_KEY`
   **in source only** — the shipped binary sends no header from the file branch. Every mutating
   `openfang` command fails with `Missing Authorization: Bearer <api_key> header` unless you export

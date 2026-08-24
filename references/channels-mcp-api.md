@@ -423,8 +423,8 @@ warning, does not block startup.
 > Bearer token" ... "Public Endpoints (No Auth Required): `GET /api/health`, `GET /`"
 
 **This is false.** The real source of truth is the `is_public` predicate in
-`crates/openfang-api/src/middleware.rs:98-140`, which whitelists **dozens** of paths/patterns
-regardless of `api_key`. Verified empirically against the live instance (which has a 51-char
+`crates/openfang-api/src/middleware.rs:145-182`, which whitelists **38** paths/patterns
+regardless of `api_key` (counted 2026-08-24; an earlier revision said "dozens" at lines 98-140). Verified empirically against the live instance (which has a 51-char
 `api_key` set) with zero `Authorization` header:
 
 | Path | Method(s) public | Live result (no auth) |
@@ -525,7 +525,7 @@ header:
 
 **Correction to an earlier version of this section:** the two checks are *not* mutually exclusive,
 because the middleware accepts the API key from a **query parameter** as well as from the header.
-`middleware.rs:196-210` honours `?token=<api_key>`, which satisfies check 1 and leaves the
+`middleware.rs:238-243` honours `?token=<api_key>`, which satisfies check 1 and leaves the
 `Authorization: Bearer` header free for `validate_webhook_token` (`routes.rs:12157-12176`). Verified
 live:
 
@@ -533,7 +533,7 @@ live:
 |---|---|
 | `Authorization: Bearer <API_KEY>` only | 401 `{"error":"Invalid or missing token"}` |
 | `Authorization: Bearer <WEBHOOK_TOKEN>` only | 401 `{"error":"Invalid API key"}` |
-| `X-API-Key: <API_KEY>` + `Authorization: Bearer <WEBHOOK_TOKEN>` | 401 — `X-API-Key` is only consulted when there is **no** Bearer header (`middleware.rs:179-184`) |
+| `X-API-Key: <API_KEY>` + `Authorization: Bearer <WEBHOOK_TOKEN>` | 401 — `X-API-Key` is only consulted when there is **no** Bearer header (`middleware.rs:222-227`) |
 | **`?token=<API_KEY>` + `Authorization: Bearer <WEBHOOK_TOKEN>`** | **200** ✅ |
 
 So a distinct scoped webhook token *is* usable; you just have to pass the master key in the query
@@ -632,8 +632,8 @@ field.
 ## 5. Gotchas (all verified against v0.6.9 code and/or the live instance)
 
 1. **`docs/api-reference.md`'s Authentication section is materially wrong.** It says only
-   `GET /api/health` and `GET /` are public; in reality **41 distinct path patterns**
-   (counted in `is_public()`, `middleware.rs:98-140`; see §4.1) are public
+   `GET /api/health` and `GET /` are public; in reality **38 distinct path patterns**
+   (counted in `is_public()`, `middleware.rs:145-182`, 2026-08-24; see §4.1) are public
    by design, including `GET /api/config`, `GET /api/agents`, `GET /api/providers`,
    `GET /api/channels`, `GET /api/sessions` (list). Don't use the doc to decide what's safe to
    expose — check `middleware.rs`'s `is_public` predicate or this file's table.

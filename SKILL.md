@@ -83,19 +83,21 @@ fatal: `PasskeyAuthService::new` returns `Err` and `server.rs:89` turns it into 
 ```toml
 [auth]
 enabled           = true
-rp_id             = "fang.moone.dev"       # bare host, no scheme, no port
-rp_origin         = "https://fang.moone.dev"  # exact HTTPS origin, host == rp_id, path "/"
+rp_id             = "<rp-host>"            # bare host, no scheme, no port
+rp_origin         = "https://<rp-host>"    # exact HTTPS origin, host == rp_id, path "/"
 rp_name           = "OpenFang"             # shown by the authenticator
 session_ttl_hours = 168                    # 1..720
 ```
 
-Every rejection below is a real start of the production image with that config, exit 101:
+Every rejection below is a real start of the production image with that config, exit 101
+(re-run 2026-08-24 with the example host substituted for the real one — all six rows still
+reproduce word for word, the message never names the host):
 
 | config | daemon says |
 |---|---|
-| `rp_origin = "http://skp.example"` | `auth.rp_origin must be an exact HTTPS origin whose host equals auth.rp_id` |
-| `rp_origin = "https://skp.example:8443"` | same |
-| `rp_origin = "https://skp.example/dash"` | same |
+| `rp_origin = "http://rp.example"` | `auth.rp_origin must be an exact HTTPS origin whose host equals auth.rp_id` |
+| `rp_origin = "https://rp.example:8443"` | same |
+| `rp_origin = "https://rp.example/dash"` | same |
 | `rp_id = "a.example"`, `rp_origin = "https://b.example"` | same |
 | `session_ttl_hours = 0` or `721` | `auth.session_ttl_hours must be between 1 and 720` |
 | `rp_id = ""` | `auth.rp_id, auth.rp_origin, and auth.rp_name are required` |
@@ -107,8 +109,8 @@ configured `rp_id` and nothing else to key on —
 
 ```console
 $ curl -s -X POST http://127.0.0.1:4201/api/auth/passkey/register/start \
-    -H 'Origin: https://fang.moone.dev' -d '{"token":"<from the invite link>"}'
-{"rp": {"name": "OpenFang", "id": "fang.moone.dev"}, "user": {…}, "slot": "skp-rp"}
+    -H 'Origin: https://<rp-host>' -d '{"token":"<from the invite link>"}'
+{"rp": {"name": "OpenFang", "id": "<rp-host>"}, "user": {…}, "slot": "<slot>"}
 ```
 
 The other half — that an authenticator refuses to release that credential to a different
@@ -129,7 +131,7 @@ docker exec <container> openfang auth reset-slot alice --output /path  # revoke 
 
 `invite` creates the slot on demand — there is no fixed list of people — and prints
 
-    Link: https://fang.moone.dev/register#<token>
+    Link: https://<rp-host>/register#<token>
 
 **The token rides in the URL fragment, so it never reaches the server.** Verified three
 ways on staging: requesting that exact link logged `path=/register status=200` with no
@@ -149,16 +151,35 @@ token_hash = ?` → 0 rows).
 `middleware.rs` carries **two** public allowlists and picks by `auth_state.auth_enabled`.
 
 Without passkey the list is wide — **38 path clauses** (`middleware.rs:145-182`, counted
-2026-08-23), most of them guarded by `&& is_get`.
-It is checked *before* any key or loopback logic, so those paths answer **200 to anyone who
-can reach the port, with no credential at all**. Reproduced on a scratch daemon with
-`auth.enabled = false`, an api_key configured, listening on `0.0.0.0`, asked from a foreign
-container address (neither loopback nor tailnet), no credentials:
+2026-08-23, re-counted 2026-08-24), 29 of them guarded by `&& is_get` and 9 not.
+It is checked *before* any key or loopback logic, so those paths answer **anyone who can
+reach the port, with no credential at all**. Reproduced on a scratch daemon with
+`auth.enabled = false`, an api_key configured, listening on `0.0.0.0`, no credentials, all
+38 clauses walked one by one (2026-08-24). **31 of them answer 200** — an earlier revision
+of this file listed 14 and read as if that were the whole surface:
 
-    /api/health 200  /api/version 200  /api/agents 200  /api/config 200  /api/providers 200
-    /api/budget 200  /api/hands   200  /api/skills 200  /api/sessions 200 /api/channels 200
-    /api/workflows 200 /api/integrations 200 /api/status 200 /api/models 200
-    POST /api/agents 401          ← writes were never in the list
+    200: /  /logo.png  /favicon.ico  /.well-known/agent.json  /api/health
+         /api/health/detail  /api/status  /api/version  /api/agents  /api/profiles
+         /api/config  /api/config/schema  /api/models  /api/models/aliases
+         /api/providers  /api/budget  /api/budget/agents  /api/network/status
+         /api/a2a/agents  /api/approvals  /api/channels  /api/hands  /api/hands/active
+         /api/skills  /api/sessions  /api/integrations  /api/integrations/available
+         /api/integrations/health  /api/workflows  /api/logs/stream  /api/cron/jobs
+
+The other seven clauses are just as unauthenticated — the middleware waves them through
+all the same — but the **handler** then declines, so the status is not 200 and it is not a
+401 either: `/a2a/` 404, `/api/approvals/<id>` 404, `/api/hands/<id>` 404,
+`/api/skills/<id>/config` 404, `/api/providers/github-copilot/oauth/status` 404,
+`/api/uploads/<name>` 400, `/api/budget/agents/<id>` 400. Tell that apart from a real
+rejection by the header: these carry **no** `www-authenticate`, while `/api/security`
+answers `401` **with** `www-authenticate: Bearer`. Writes were never in either list:
+
+    POST /api/agents 401 (www-authenticate: Bearer)
+
+Asked twice with no credentials at all — through the loopback-published port (so the peer
+is the bridge gateway) and from a second container at a foreign bridge address; the
+results agree, and `/api/agents`, `/api/config`, `/api/cron/jobs` and `/api/logs/stream`
+were 200 both ways.
 
 That is exactly the 2026-08-23 incident: a public route raised in front of a
 non-passkey daemon served `/api/agents` 200 without credentials for two minutes.
@@ -169,10 +190,26 @@ With passkey the list is narrow. Measured against staging (`auth.enabled = true`
 credentials:
 
     200: /  /login  /register  /logo.png  /favicon.ico  /api/health
-         POST /api/auth/passkey/{login,register}/{start,finish}
     401: /api/version /api/agents /api/status /api/config /api/budget /api/hands
          /api/skills /api/cron/jobs /api/models /api/health/detail /api/logs/stream
          /.well-known/agent.json /a2a/ /api/uploads/…
+
+The four passkey ceremonies — `POST /api/auth/passkey/{login,register}/{start,finish}` —
+are on the allowlist too, but **they do not answer 200 to an uninvited caller**, and an
+earlier revision of this file put them in the 200 bucket. Measured against staging
+2026-08-24, no credentials:
+
+    POST …/login/start     Origin absent  -> 403 {"error":"invalid request origin"}
+    POST …/login/start     Origin correct -> 401 {"error":"no passkeys are registered"}
+    POST …/register/start  {"token":"nope"}
+                                          -> 401 {"error":"registration invitation is
+                                                  invalid, expired, or already used"}
+    POST …/login/finish    {}             -> 422 missing field `ceremony_id`
+    POST …/register/start  {}             -> 422 missing field `token`
+    POST …/register/finish {}             -> 422 missing field `ceremony_id`
+
+All six are handler answers, not middleware ones: none carries `www-authenticate`. "On the
+allowlist" means the middleware does not stop you, not that the route hands anything out.
 
 `/api/auth/check` also answers 401 without a session, but it is a **different** 401: it
 passes the middleware and the handler declines. Tell them apart by the header — a
@@ -212,9 +249,9 @@ one key, one instant:
 | asked from | result |
 |---|---|
 | `127.0.0.1:4298` — published loopback port | **401** `{"error":"Invalid API key"}` |
-| `100.91.165.20:4298` — published tailnet port | **200** |
+| `<tailnet-ip>:4298` — published tailnet port | **200** |
 | `127.0.0.1:4200` — inside the container | **200** |
-| `100.91.165.20:4298` with no key / a wrong key | 401 — the tailnet is not trusted on its own |
+| `<tailnet-ip>:4298` with no key / a wrong key | 401 — the tailnet is not trusted on its own |
 
 Consequences for the tools in `scripts/`: `ofctl`'s default `http://127.0.0.1:4200` gets
 401 on a passkey box (`ofctl: HTTP 401 on GET /api/version`, exit 1), and the same call at
@@ -225,12 +262,12 @@ which is a **misdiagnosis** — the key and header are fine. See `scripts/README
 And the worst one: **the in-container CLI renders that 401 as an empty result.**
 
 ```bash
-docker exec openfang-staging openfang agent list
-#   No agents running.                        ← there are three
-K=$(grep -m1 '^api_key = ' /var/lib/docker/volumes/openfang-staging-data/_data/config.toml | cut -d'"' -f2)
-docker exec -e OPENFANG_API_KEY="$K" openfang-staging openfang agent list
-#   ID                                     NAME         STATE    PROVIDER     MODEL
-#   484987e6-…  AgentKimi3  Running  y7router  kimi/k3   … and two more
+docker exec <container> openfang agent list
+#   No agents running.                        ← there were 14 (measured 2026-08-24)
+K=$(grep -m1 '^api_key = ' <host path to the volume>/config.toml | cut -d'"' -f2)
+docker exec -e OPENFANG_API_KEY="$K" <container> openfang agent list
+#   ID                    NAME             STATE    PROVIDER     MODEL
+#   <agent-id>            <agent-name>     Running  y7router     kimi/k3   … and 13 more
 ```
 
 `openfang auth …` is the exception — it reads the database directly, not the API, so it
@@ -631,11 +668,11 @@ someone who was not there.
   the key never enters OpenFang's own state (`youtube-pipeline.md` §5). `ofcron` has no flag for a
   webhook auth header, on purpose.
 - **38** path patterns are public in the no-passkey branch (`middleware.rs:145-182`, counted
-  2026-08-23; an earlier revision said 41 at lines 98-140 and both had gone stale), including
-  `/api/agents`, `/api/config`,
+  2026-08-23, re-counted 2026-08-24; an earlier revision said 41 at lines 98-140 and both had gone
+  stale), including `/api/agents`, `/api/config`,
   `/api/sessions`, `/api/approvals` (leaks 200 chars of every gated command), `/api/hands/*/settings`
   (leaks text-setting values), `/api/health/detail`, and `/api/logs/stream` — which SSE-streams the
-  whole Merkle audit chain that `/api/audit/recent` protects. (Eleven of the 41 lack an `is_get`
+  whole Merkle audit chain that `/api/audit/recent` protects. (**Nine** of the 38 lack an `is_get`
   guard; that is *not* a write bypass — `security-model.md` §10.6c.)
 - **`POST /mcp` turns the API key into an arbitrary-file-read primitive.** `mcp_http` calls
   `execute_tool` with `allowed_tools=None`, `workspace_root=None`, `exec_policy=None`
@@ -723,8 +760,10 @@ Don't rewrite these from scratch — they are known-good and already ran on this
 | `scripts/ofcron` | Create / list / enable / disable / run / rm, validating locally everything the API 400s on and resolving agent names to UUIDs. |
 | `scripts/ofbackup` | WAL-safe snapshot via SQLite's backup API + state tarball + a restore that strips stale `-wal`/`-shm`. |
 | `scripts/ofcheck-rs` | `cargo check`/`clippy` for a **fork source worktree**, run inside a container — no Rust toolchain needed on the host. `ofcheck-rs <worktree-path> [crate...]`. The build-target Docker volume is named `fang-target-$(basename <worktree>)-` (`ofcheck-rs:21-22`) — **by directory name only**, so two worktrees whose directories share a name still share a volume and cargo can replay one tree's fingerprint for the other. `ofgate` fixed this with an owner marker; `ofcheck-rs` and `ofmutate` did not. First check per worktree is ~4.5 min, then incremental; a build target runs 5-12 GB, so free ≥12G before running it and `docker volume rm fang-target-<slug>` after a patch lands. For patching `/root/src/openfang` itself, not for operating the running instance. |
-| `scripts/ofgate` | Runs what Fork CI runs, in CI's order, in a container: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -- --test-threads=2`. Use it to fail fast before pushing and save CI round trips. **It is not proof of anything.** Its verdict block is self-signed with no key, and it can print GREEN without compiling: the build-target volume is keyed to the worktree path, so a tree redeployed at that path by `cp -a` / `rsync -a` / `git archive \| tar -x` / `docker cp` keeps mtimes cargo considers fresh. Reproduced twice; `scripts/README.md` carries the transcript and the workaround (delete the volume, or use a never-used worktree path). What counts as done is a green CI run: `gh run view -R kyzdes/fang-upgrade <id> --json status,conclusion,headSha`. |
+| `scripts/ofgate` | Runs the **three cargo commands** of Fork CI's `check` job, in CI's order, in a container: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -- --test-threads=2` — and nothing else from the workflow: not the "toolchain versions agree in all four places" step, not the Tauri system-dep install, not the `image` job that builds the Dockerfile. Use it to fail fast before pushing and save CI round trips. **It is not proof of anything.** Its verdict block is self-signed with no key, and it can print GREEN without compiling: the build-target volume is keyed to the worktree path, so a tree redeployed at that path by `cp -a` / `rsync -a` / `git archive \| tar -x` / `docker cp` keeps mtimes cargo considers fresh. Reproduced twice; `scripts/README.md` carries the transcript and the workaround (delete the volume, or use a never-used worktree path). What counts as done is a green CI run: `gh run view -R kyzdes/fang-upgrade <id> --json status,conclusion,headSha`. |
 | `scripts/ofmutate` | Mechanical red-before-green for a fork patch: `ofmutate <worktree> --test <filter> -p <crate>`. Runs the filtered test as committed (must be green **and** non-empty), reverse-applies only the patch's *production* hunks — Rust unit tests sit in the same file under `#[cfg(test)]`, so reverting whole files would delete the test along with the fix and prove nothing — then requires red, then restores the tree. `ДОКАЗАНО (RED-ASSERT)` is proof; `СЛАБОЕ КРАСНОЕ (RED-COMPILE)` only proves the test knows the new API, not that it checks its behaviour; `ТАВТОЛОГИЯ` (exit 1) and the `passed=0` refusal (exit 4, filter matched nothing) mean there is effectively no test. Refuses a dirty worktree (exit 2) and <12 GB free (exit 3 — the tool declining, **not** a patch defect). Shares `ofcheck-rs`'s build volume, so runs stay incremental: measured 203 s cold / 35 s warm on `openfang-runtime` — and inherits its unsafe naming (`volume_slug()` is `basename` and nothing else, `ofmutate:73-76`), so run it from a uniquely named worktree. On its first real use it found a tautology in an existing fork patch (`fix/file-read-truncation`: `test_file_read_full_file_no_truncation_marker` passes with the fix reverted). |
+| `scripts/ofledger` | Rolls up the workflow journals of many runs: the per-run "не проверял" lists, what repeats across runs, and a done/error/retry/token summary per agent. Exit 0 only when it found something to report on **two or more** runs; exit 2 on a single-run directory, so a lone run cannot be dressed up as a trend. |
+| `scripts/ofscrub` | Greps this skill's tree for text that names **one particular install** — the deployment's domain, its retired host name, its public IPv4, a literal tailnet address where `<tailnet-ip>` belongs, a `*.ts.net` name, a passkey slot name, a literal `rp_id`/`rp_origin`. Reports only, never edits; skips `.git/`, `__pycache__/` and its own source (the rules quote the strings they hunt for). Exit 0 clean · 1 hit · 2 bad args. This is what makes `README.md`'s "substitute your own" a checkable promise rather than a wish. |
 | `scripts/ytwatch.py` | Channel listing + caption fetch (no video download) + `seen.json` dedup. Written as a file precisely because `shell_exec` rejects pipes and redirection. Install: `docker exec openfang-openfang-1 mkdir -p /data/workspaces/<agent>/bin` then `docker cp ~/.claude/skills/fang-upgrade/scripts/ytwatch.py openfang-openfang-1:/data/workspaces/<agent>/bin/` (needs `pip3 install --break-system-packages yt-dlp` in the container). |
 | `scripts/rtwatch.py` | RuTube sibling of `ytwatch.py`, same design (flat argv, one JSON object per call, `seen.json` dedup) but not a drop-in: no RSS feed (uses `yt-dlp --flat-playlist`), subtitles are `srt` under `subtitles` not `automatic_captions` (`--write-subs`, not `--write-auto-subs`), and video ids are 32-char hex, not 11-char base64. Same install pattern as `ytwatch.py`, different filename. |
 | `assets/youtube-insights-hand/` | A complete working `HAND.toml` + `SKILL.md`. Start any new hand by copying this, not from a blank file. Install: `ofhand install ~/.claude/skills/fang-upgrade/assets/youtube-insights-hand`. `assets/README.md` covers the manual host-volume copy, why `docker cp <dir> …:/data/hands/<id>` silently nests and reloads the old definition, and the fact that the deployed copy still carries the unreachable `timeout_seconds: 240`. |

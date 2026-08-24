@@ -623,7 +623,7 @@ Routes registered in `crates/openfang-api/src/server.rs:435-484`.
 
 **There is no delete/uninstall route for a hand *definition*.**
 
-Auth: the three hands rules are `middleware.rs:125-127` (`:124` is `/api/channels`) — `/api/hands`,
+Auth: the three hands rules are `middleware.rs:170-172` (`:169` is `/api/channels`) — `/api/hands`,
 `/api/hands/active`, and at **`:127`** the wildcard **`path.starts_with("/api/hands/") && is_get`**.
 That last rule makes every hands GET unauthenticated,
 including `/settings` — which returns `current_values`, i.e. anything typed into a text setting

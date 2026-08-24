@@ -295,7 +295,7 @@ workflow's runs returned runs belonging to three different workflows.
 
 ## 1.8 REST API
 
-Auth: `GET /api/workflows` (the bare list) is in the public allowlist (`middleware.rs:134`) and needs
+Auth: `GET /api/workflows` (the bare list) is in the public allowlist (`middleware.rs:179`) and needs
 no key. **Every other workflow endpoint, including `GET /api/workflows/{id}`, requires
 `Authorization: Bearer <API_KEY>`.**
 
@@ -863,7 +863,7 @@ curl -s -X DELETE -H "Authorization: Bearer $K" http://127.0.0.1:4200/api/cron/j
   enabled + reserves `next_run` (only advancing it if already overdue), then executes in a background
   task. Returns `{"status":"triggered","job_id":...}` immediately — poll `/status`.
   404 if unknown, 400 if disabled.
-- **`GET /api/cron/*` is in the public allowlist** (`middleware.rs:136`) — job definitions, agent IDs and
+- **`GET /api/cron/*` is in the public allowlist** (`middleware.rs:181`) — job definitions, agent IDs and
   prompt text are readable without any credential. Writes require the key.
 
 ### `/api/schedules` — legacy/dashboard shape (`routes.rs:9123-9581`, `server.rs:347-363`)
@@ -1034,11 +1034,11 @@ every request 401 with `{"error":"Invalid or missing token"}` and no other diagn
 **[verified live]** with a 30-char token.
 
 ### Double authentication — the part that will waste your afternoon
-`/hooks/*` is **not** in the public allowlist (`middleware.rs:98-140`), so the API-key middleware runs
+`/hooks/*` is **not** in the public allowlist (`middleware.rs:145-182`), so the API-key middleware runs
 first and wants `Authorization: Bearer <API_KEY>`. Then the handler wants
 `Authorization: Bearer <OPENFANG_WEBHOOK_TOKEN>`. Same header, two different values.
 
-`X-API-Key` does **not** rescue you: `middleware.rs:179-184` uses
+`X-API-Key` does **not** rescue you: `middleware.rs:222-227` uses
 `bearer_token.or_else(|| x-api-key)` — the fallback is only consulted when there is **no** Bearer
 header at all. **[verified live]**:
 
@@ -1049,7 +1049,7 @@ header at all. **[verified live]**:
 | `X-API-Key: <API_KEY>` + `Authorization: Bearer <WEBHOOK_TOKEN>` | 401 `{"error":"Invalid API key"}` — X-API-Key ignored |
 | **`?token=<API_KEY>` + `Authorization: Bearer <WEBHOOK_TOKEN>`** | **200** ✅ |
 
-The only other way is to leave `api_key` empty and call from loopback (`middleware.rs:155-158`), or to
+The only other way is to leave `api_key` empty and call from loopback (`middleware.rs:198-201`), or to
 set `api_key` equal to the webhook token.
 
 Working invocations **[verified live]** — but note that neither `[webhook_triggers]` nor
@@ -1460,7 +1460,7 @@ default `assistant` created by the "no agents found" fallback (`kernel.rs:1548-1
 29. `schedule_list` shows only the caller's jobs, so an agent cannot manage jobs it created for another
     agent — but `schedule_delete` / `cron_cancel` have **no ownership check** and will delete any job.
 30. `model_override` on a cron `agent_turn` is stored and never used.
-31. **`GET /api/cron/*` is unauthenticated (`middleware.rs:136`) and returns the whole `JobMeta`,
+31. **`GET /api/cron/*` is unauthenticated (`middleware.rs:181`) and returns the whole `JobMeta`,
     `delivery_targets` included.** Reproduced on this box before the job was deleted (there are now
     zero cron jobs and `cron_jobs.json` is `[]`): a job's webhook target contained
     `{"type":"webhook","url":"http://127.0.0.1:4200/api/agents/…/session/reset",

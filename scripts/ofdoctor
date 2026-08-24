@@ -514,7 +514,7 @@ def check_storage(cfg):
         record(
             "NOTE",
             "daemon listens on all interfaces",
-            f"listen_addr={listen}; 41 path patterns need no credential, so everything "
+            f"listen_addr={listen}; 38 path patterns need no credential, so everything "
             "reachable on the Tailnet can read /api/agents, /api/config, /api/cron/*",
         )
 

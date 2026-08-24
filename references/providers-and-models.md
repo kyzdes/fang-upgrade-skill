@@ -986,7 +986,7 @@ did model X cost" and only one of them actually does.
 
 **Which one answers "which model burned the tokens this hour"?** `openfang_llm_tokens_total`, never
 `openfang_tokens_total` — the latter's labels are frozen to the agent's config and will lie about the
-model on any turn a fallback served. Verified live on this box: `AgentGemma4`'s
+model on any turn a fallback served. Verified live on this box, on one agent (`<agent-name>`): its
 `openfang_tokens_total{...,model="google/gemma-4-31b-it"}` reads `88267`, and its
 `openfang_llm_calls_total{...,model="google/gemma-4-31b-it"}` reads `5` calls for `88267` combined
 input+output tokens — consistent here only because that agent has never fallen back; the two series

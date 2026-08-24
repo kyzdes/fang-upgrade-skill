@@ -770,7 +770,7 @@ Read side: `GET /api/audit/recent?n=N` and `GET /api/audit/verify`
 
 ### 10.4 …but the chain is readable without auth
 
-`GET /api/logs/stream` is in the public list (`middleware.rs:135`) and its handler
+`GET /api/logs/stream` is in the public list (`middleware.rs:180`) and its handler
 (`routes.rs:5488-5571`) polls `audit_log.recent(200)` every second and SSEs
 `{seq,timestamp,agent_id,action,detail,outcome,hash}` — the same rows `/api/audit/recent` protects.
 [verified live: `curl -N http://127.0.0.1:4200/api/logs/stream` with no credentials streams the chain.]
@@ -798,12 +798,12 @@ with a random `SaltString`, and prints a ready-to-paste `[auth]` block. `verify_
 the PHC string; a legacy SHA-256 hex hash is rejected outright, and `server.rs:111-118` logs a
 startup warning if `enabled && !password_hash.starts_with("$argon2")`.
 
-Fail-closed rule (`middleware.rs:154-169`, issue #1034): if `api_key` is empty **and**
+Fail-closed rule (`middleware.rs:197-212`, issue #1034): if `api_key` is empty **and**
 `[auth].enabled == false`, only loopback peers (`ConnectInfo` IP `is_loopback()`, default-deny when
 `ConnectInfo` is absent) get through; everyone else gets 401 unless `OPENFANG_ALLOW_NO_AUTH=1`.
 `/api/shutdown` skips token auth entirely when the peer is loopback (`:88-90`).
 
-**The public (no-auth) route list** (`middleware.rs:98-140`) — non-GET always requires auth:
+**The public (no-auth) route list** (`middleware.rs:145-182`) — non-GET always requires auth:
 
 ```
 /  /logo.png  /favicon.ico  /api/health  /api/health/detail  /api/status  /api/version
@@ -829,7 +829,7 @@ IDs and message counts; `/api/health/detail` returns agent count, uptime, panic/
 ### 10.6 **Auth bypass: empty credential vs empty `api_key`** [verified live on v0.6.9]
 
 When `api_key` is empty **and** `[auth].enabled = true`, the early fail-closed branch at
-`middleware.rs:155` is skipped (because `auth_enabled` is true), execution falls through to
+`middleware.rs:198` is skipped (because `auth_enabled` is true), execution falls through to
 `api_key = ""`, and the comparison becomes:
 
 ```rust
@@ -861,7 +861,7 @@ the HTTP middleware never got the same treatment).
 
 ### 10.6b Cron `delivery_targets` is an unencrypted secret store behind a public read endpoint
 
-**SEVERE (mechanism), previously live on this box.** `middleware.rs:136` whitelists `GET /api/cron/*`, and the cron
+**SEVERE (mechanism), previously live on this box.** `middleware.rs:181` whitelists `GET /api/cron/*`, and the cron
 handler returns the **entire** `JobMeta` record — including `delivery_targets`. A webhook target
 looks like this:
 
@@ -885,11 +885,12 @@ webhook secret, or anything sensitive into `delivery_targets`, and block `/api/c
 
 ### 10.6c `/api/logs/stream` has no method guard — but that is not an auth bypass
 
-`path == "/api/logs/stream"` at `middleware.rs:135` carries no `is_get`, so **any** method on that
-path skips the auth middleware. It is **not the only such entry** — eleven of the 41 patterns have no
-`is_get`: `/`, `/logo.png`, `/favicon.ico`, `/api/health`, `/api/health/detail`, `/api/status`,
-`/api/version`, `/api/logs/stream`, `/api/providers/github-copilot/oauth/*`, `/api/auth/login`,
-`/api/auth/logout`.
+`path == "/api/logs/stream"` at `middleware.rs:180` carries no `is_get`, so **any** method on that
+path skips the auth middleware. It is **not the only such entry** — **nine of the 38** clauses of the
+no-passkey allowlist have no `is_get` (`middleware.rs:145-182`, counted 2026-08-24): `/`,
+`/logo.png`, `/favicon.ico`, `/api/health`, `/api/health/detail`, `/api/status`, `/api/version`,
+`/api/logs/stream`, `/api/providers/github-copilot/oauth/*`. An earlier revision said "eleven of the
+41" and also listed `/api/auth/login` and `/api/auth/logout`, which are not on the list at all.
 
 And it does not buy an attacker a write: every one of those paths is registered on a single method
 (`/api/logs/stream` is `axum::routing::get`, `server.rs:501`), so the router answers a non-GET with
@@ -902,7 +903,7 @@ audit chain**. The real problem is the unauthenticated GET, not the method gap.
 `is_loopback` is derived from `ConnectInfo` (`middleware.rs:79-83`), and inside the container the
 peer is always the bridge gateway. Verified by decoding `/proc/net/tcp` inside the container during a
 host-side `curl http://127.0.0.1:4200`: the peer was **172.19.0.1**, not 127.0.0.1. So the
-`api_key.is_empty() && !auth_enabled` branch (`middleware.rs:155-167`) takes the *non*-loopback path
+`api_key.is_empty() && !auth_enabled` branch (`middleware.rs:197-212`) takes the *non*-loopback path
 and 401s everything non-public. Two consequences:
 
 - Clearing `api_key` in a Docker deployment breaks the API rather than opening it.
@@ -1000,7 +1001,7 @@ again — a classic TOCTOU/DNS-rebinding window. Also `mcp.rs:329` has a *second
 7. **`GET /api/approvals` is unauthenticated** and leaks the first 200 chars of every gated tool
    call's input.
 8. **`GET /api/logs/stream` is unauthenticated** and streams the Merkle audit chain that
-   `/api/audit/recent` protects (`middleware.rs:135`) — verified live, 200 with no credential.
+   `/api/audit/recent` protects (`middleware.rs:180`) — verified live, 200 with no credential.
    It is one of **eleven** `is_public()` entries with no `is_get` guard, but the route is
    GET-only, so a non-GET gets 405 from the router, not a write bypass (§10.6c).
 8b. **`GET /api/cron/*` is unauthenticated and dumps `delivery_targets` verbatim**, including any

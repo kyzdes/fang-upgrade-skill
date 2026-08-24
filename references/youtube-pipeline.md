@@ -806,7 +806,7 @@ Cron `agent_turn`s all land in one session and history is only trimmed at 20 mes
 **Do not solve this with a `delivery_targets` webhook at `…/session/reset`.** An earlier version of
 this build did exactly that, and it was a live credential leak: `POST /api/agents/{id}/session/reset`
 needs the daemon key, `delivery_targets` is stored cleartext in `$OF/cron_jobs.json`, and
-`GET /api/cron/*` is in the public allowlist (`middleware.rs:136`) and returns `delivery_targets`
+`GET /api/cron/*` is in the public allowlist (`middleware.rs:181`) and returns `delivery_targets`
 **verbatim** — so the key was served, with no credential, to anything on loopback *or*
 `<tailnet-ip>:4200` (Tailscale). That key is also a whole-filesystem read primitive via `POST /mcp`
 (`security-model.md` §3.6b), so it is not a small leak. There is no credential-free variant: a
@@ -1223,7 +1223,7 @@ Everything here was hit and confirmed on this box, not read in a doc.
    any `openfang` command that writes.**
 3. **Most GET endpoints are unauthenticated.** `/api/agents`, `/api/hands`,
    `/api/models`, `/api/cron/*` all return 200 with no key
-   (`middleware.rs:98-140`). GET `/api/agents` exposes agent list; `/api/config` too.
+   (`middleware.rs:145-182`). GET `/api/agents` exposes agent list; `/api/config` too.
    POST/PUT/DELETE always require auth. This is why `openfang agent list` "works"
    despite gotcha 2. Relevant because the dashboard is published on
    `<tailnet-ip>:4200` as well as loopback.

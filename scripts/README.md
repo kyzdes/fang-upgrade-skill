@@ -1,6 +1,6 @@
 # Bundled scripts
 
-Eleven scripts. `ofctl`, `ofdoctor`, `ofhand`, `ofcron`, `ofbackup` run on the host and
+Twelve scripts. `ofctl`, `ofdoctor`, `ofhand`, `ofcron`, `ofbackup` run on the host and
 talk to the running daemon; `ytwatch.py` and `rtwatch.py` run *inside* the container as
 flat-argv helpers (`shell_exec` rejects pipes/redirection, so intake logic has to live in
 a script file, not a prompt); `ofcheck-rs` runs on the host but talks to neither — it
@@ -9,11 +9,12 @@ patches can be checked without installing Rust on the host — but see the warni
 section: **its exit code is always 0**, so it cannot be used as proof. Neither can
 `ofgate`, for two different reasons set out in its own section — the gate that decides
 "done" is **CI**, and the only artefact that counts as evidence is a CI run id.
-`ofmutate` reverse-applies a patch to check its test would go red without it, and
-`ofledger` reads the workflow journals. Everything is POSIX `sh` or
+`ofmutate` reverse-applies a patch to check its test would go red without it,
+`ofledger` reads the workflow journals, and `ofscrub` greps this repo for text that names
+one particular install. Everything is POSIX `sh` or
 python3 stdlib, so they have no dependency beyond what is already on the host, and
-nothing to install in the container (which has no `curl`). Each of the five API tools and
-`ofcheck-rs` takes `--help`.
+nothing to install in the container (which has no `curl`). Each of the five API tools,
+`ofcheck-rs` and `ofscrub` takes `--help`.
 
 Put them on `$PATH` once per session, or call them by absolute path:
 
@@ -72,13 +73,13 @@ bridge gateway. A port published on the **tailnet** address is DNAT'd instead, a
 source survives. Same scratch daemon, `auth.enabled = true`, same key, one instant:
 
     127.0.0.1:4298     published loopback port   -> 401 {"error":"Invalid API key"}
-    100.91.165.20:4298 published tailnet port    -> 200
+    <tailnet-ip>:4298  published tailnet port    -> 200
     127.0.0.1:4200     from inside the container -> 200
 
     $ OPENFANG_URL=http://127.0.0.1:4298    ofctl GET /api/version ; echo $?
     ofctl: HTTP 401 on GET /api/version
     1
-    $ OPENFANG_URL=http://100.91.165.20:4298 ofctl -x git_sha GET /api/version ; echo $?
+    $ OPENFANG_URL=http://<tailnet-ip>:4298 ofctl -x git_sha GET /api/version ; echo $?
     1009ed230dcbbc86afd81d0dd17c5cd83e1b7231
     0
 
@@ -287,8 +288,8 @@ ids are 32-char hex instead of YouTube's 11-char base64 form. Install the same w
     ofgate <worktree> --only fmt
     ofgate <worktree> --only fmt,clippy --wait
 
-Runs exactly what `.github/workflows/fork-ci.yml` runs, in the CI's order, with the
-command lines copied out of that file rather than from memory:
+Runs the **three cargo commands** of the `check` job in `.github/workflows/fork-ci.yml`, in
+the CI's order, with the command lines copied out of that file rather than from memory:
 
 | step | command |
 |---|---|
@@ -299,6 +300,23 @@ command lines copied out of that file rather than from memory:
 The `-- --test-threads=2` on the test step is in the workflow (it bounds peak memory on
 GitHub runners), so it is here too. Like CI, `ofgate` stops at the first red step.
 
+**It is not "everything CI runs", and an earlier revision of this file said it was.**
+Diffed against the workflow on 2026-08-24, `ofgate` does *not* run:
+
+* `actions/checkout` and `dtolnay/rust-toolchain` — `ofgate` uses whatever tree you point
+  it at and a toolchain image it pins itself, so a `rust-toolchain.toml` bump can pass here
+  and fail there;
+* the **"версии тулчейна сходятся во всех четырёх местах"** step — the one that fails the
+  build when `rust-toolchain.toml`, `Cargo.toml`'s `rust-version`, the `FROM rust:` lines in
+  `Dockerfile` and the workflow's own `toolchain:` disagree (FANG-92). This is a real red
+  that `ofgate` will never show you;
+* `Swatinem/rust-cache` and the Tauri system-dep `apt-get install`;
+* the entire second job, **`image`** (`needs: [check]`) — the Dockerfile build that produces
+  what the servers actually pull. A branch that is green here can still fail there; that is
+  exactly how the passkey branch pinned `Dockerfile` below the declared MSRV.
+
+So a green `ofgate` means "the three cargo commands pass on my tree", nothing wider.
+
 ### What it is, and what decides "done"
 
 An earlier revision of this file titled this section "the one command that decides
@@ -307,9 +325,15 @@ by argument.
 
 **One: evidence printed by the claimant is forgeable in a minute.** The verdict block is
 self-signed — its closing `sha256` covers the body printed above it, the step hashes cover
-files the same process wrote, and there is no key (`grep -n
-'hmac\|secret\|OFGATE_KEY\|openssl' ofgate` returns nothing). Redone from scratch on
-2026-08-23: a full three-step GREEN block typed into a file, one `sha256sum` of the body
+files the same process wrote, and there is no key. That last one is checkable, but the
+plain `grep -n 'hmac\|secret\|OFGATE_KEY\|openssl' ofgate` an earlier revision printed here
+does **not** return nothing: it returns the comment inside `ofgate` that quotes the very
+same pattern. Strip the comments first and it is empty —
+
+    $ sed 's/#.*//' ofgate | grep -c 'hmac\|secret\|OFGATE_KEY\|openssl'
+    0
+
+Redone from scratch on 2026-08-23: a full three-step GREEN block typed into a file, one `sha256sum` of the body
 appended as the closing line, and it self-checks —
 
     $ head -n -1 fake.txt | sha256sum | cut -d' ' -f1
@@ -587,7 +611,7 @@ Ownership is recorded *inside* the volume, in `.ofgate-owner`, which holds the r
 of the tree that claimed it:
 
 * volume absent → create it, write the marker;
-* marker matches → it is ours, build incrementally;
+* marker names this very tree → the volume belongs to it, build incrementally;
 * marker names another tree → use `fang-target-<slug><hash-of-path>` instead;
 * **no marker** (a volume from the old naming scheme) → do not adopt it silently. The
   default is to move to the path-hashed volume and rebuild from cold. Adopting the old
@@ -724,7 +748,9 @@ Every run prints a fixed-shape block meant to be pasted into a report verbatim:
 **The block is not tamper-proof and cannot be, in this scheme.** The closing line is the
 `sha256` of the very body printed above it; the step lines are `sha256`s of files the
 same process wrote; there is no key —
-`grep -n 'hmac\|secret\|OFGATE_KEY\|openssl' ofgate` returns nothing. A complete,
+`sed 's/#.*//' ofgate | grep -c 'hmac\|secret\|OFGATE_KEY\|openssl'` prints `0`. (Without
+the `sed` it prints `1`: `ofgate` carries a comment quoting that pattern, so the grep finds
+itself. An earlier revision of this file offered the bare grep as the proof.) A complete,
 self-consistent GREEN block is assembled by hand with one `sha256sum` call and no cargo
 container is started; that was measured, not assumed. Earlier revisions of this file
 claimed "retelling it is detectable" — that claim was false and has been removed.
@@ -821,3 +847,47 @@ mean the work was lost outright, not just delayed. Exit 0 only when it actually
 found something to report on **two or more** runs; exit 2 on missing/empty input,
 a single-run directory (nothing to compare — a lone run can't "repeat"), or bad
 arguments — never a quiet empty success.
+
+---
+## `ofscrub` — keeps README's placeholder promise checkable
+
+    ofscrub                 # scan the skill tree this script lives in
+    ofscrub <dir>           # scan another tree (a git worktree, a release tarball)
+    ofscrub --list          # print the rules and exit 0
+
+`README.md` promises that "addresses and host names appear as `<tailnet-ip>`,
+`<public-ip>`, `<tailnet-host>`". Nothing enforced it, and it was broken twice by hand —
+a tailnet address landed in `SKILL.md`'s peer-source table and in this file's `ofctl`
+section, and a relying-party domain plus a live passkey slot name landed in `SKILL.md`'s
+passkey section. This repo is public.
+
+`ofscrub` greps for the classes of text that name **one particular install** rather than
+any install: the deployment's public domain, its retired host name, its public IPv4, a
+literal Tailscale CGNAT address where `<tailnet-ip>` belongs, a `*.ts.net` MagicDNS name,
+a passkey slot name printed as a value, and a literal `rp_id`/`rp_origin`. Reserved
+example domains (`.example`, `.invalid`, `.test`), the `100.64.0.0/10` range itself and
+Tailscale's fixed `100.100.100.200` resolver are forgiven by rule, not by hand.
+
+It reports and never edits. `.git/`, `__pycache__/`, binary files and **its own source**
+are skipped — the rule table contains the strings it hunts for, so scanning itself would
+always hit. That is the entire exemption, and it is printed on every run.
+
+Exit 0 clean · 1 at least one hit · 2 bad arguments. That it can actually go red was shown
+against this repo's own published tree rather than a canary (the found strings are redacted
+in the transcript below, for the obvious reason):
+
+    $ git worktree add --detach /tmp/head HEAD          # 73cb6c6, before this change
+    $ ofscrub /tmp/head ; echo $?
+    HIT  public domain of this install
+           SKILL.md:86:rp_id             = "<the domain>"       # bare host, no scheme, no port
+           … 4 more
+    HIT  tailnet address literal (must be <tailnet-ip>)
+           SKILL.md:215 SKILL.md:217 scripts/README.md:75 scripts/README.md:81
+    HIT  passkey slot name printed literally
+    HIT  relying-party id printed literally
+    HIT  relying-party origin printed literally
+    ofscrub: FAIL — the placeholder promise in README.md is not true right now
+    1
+    $ ofscrub ; echo $?          # the same tree with this change applied
+    ofscrub: clean
+    0
