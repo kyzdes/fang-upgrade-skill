@@ -312,8 +312,11 @@ Diffed against the workflow on 2026-08-24, `ofgate` does *not* run:
   that `ofgate` will never show you;
 * `Swatinem/rust-cache` and the Tauri system-dep `apt-get install`;
 * the entire second job, **`image`** (`needs: [check]`) — the Dockerfile build that produces
-  what the servers actually pull. A branch that is green here can still fail there; that is
-  exactly how the passkey branch pinned `Dockerfile` below the declared MSRV.
+  what the servers actually pull. A branch that is green here can still fail there, and the
+  workflow's own comment on that job records it happening (`fork-ci.yml:125-128`): "ветка
+  пасскея прибила Dockerfile
+  к rust 1.88 — ниже MSRV, объявленного в Cargo.toml, — PR прошёл зелёным … а упало при
+  первой же сборке образа с main". That history is the comment's, not a run of mine.
 
 So a green `ofgate` means "the three cargo commands pass on my tree", nothing wider.
 
