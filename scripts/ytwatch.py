@@ -264,9 +264,60 @@ def cmd_fetch(a):
     )
 
 
+_YT_ID_RE = re.compile(r"^-[A-Za-z0-9_-]{10}$")
+
+
+def _rescue_leading_dash_id(argv):
+    """Идентификаторы YouTube бывают с ведущим дефисом, и argparse читает такой
+    токен как связку коротких флагов.
+
+    `ytwatch fetch -fF1ufNJoho` умирает на
+    "the following arguments are required: video_id", потому что `-fF1ufNJoho`
+    разбирается как -f -F -1 -u ... Ролик при этом настоящий: он был первым в
+    очереди 2026-08-25 и заблокировал весь прогон — агент повторял ту же команду,
+    пока не выбрал 50 итераций, и до остальных двенадцати не дошёл.
+
+    Форма, которую argparse принимает, — флаги, затем `--`, затем значение
+    (проверено прогоном). Приводим argv к ней сами, чтобы вызывающему не надо
+    было знать этой тонкости.
+
+    Распознаём по форме, а не по позиции: ровно 11 знаков алфавита YouTube,
+    первый из которых дефис. Ни один флаг ytwatch такой формы не имеет — все
+    длинные (`--stride`) либо `-h`, — поэтому ложное срабатывание невозможно.
+    """
+    if len(argv) < 2 or argv[0] not in ("fetch", "mark"):
+        return argv
+    ids = [i for i, tok in enumerate(argv[1:], 1) if _YT_ID_RE.match(tok)]
+    if not ids:
+        return argv
+    i = ids[0]
+    return argv[:i] + argv[i + 1:] + ["--", argv[i]]
+
+
+class _JsonArgParser(argparse.ArgumentParser):
+    """Ошибка разбора аргументов — не повод повторять команду.
+
+    Обычный argparse печатает usage в stderr и выходит с кодом 2. Агент читает
+    это как сбой без признака «повторять бессмысленно» и, следуя правилу
+    «повтори один раз при сбое», уходит в цикл. Отдаём тот же контракт, что и
+    остальные ветви скрипта: JSON с ok=false и явным retryable=false.
+    """
+
+    def error(self, message):
+        out = {
+            "ok": False,
+            "error": "bad_arguments",
+            "detail": message,
+            "retryable": False,
+            "hint": "проверь аргументы; повтор той же команды даст тот же результат",
+        }
+        sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+        sys.exit(2)
+
+
 def main():
-    p = argparse.ArgumentParser(prog="ytwatch")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p = _JsonArgParser(prog="ytwatch")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=_JsonArgParser)
 
     r = sub.add_parser("resolve"); r.add_argument("channel")
     l = sub.add_parser("list"); l.add_argument("channel"); l.add_argument("--max", type=int, default=15)
@@ -286,7 +337,7 @@ def main():
     f.add_argument("--chunk-chars", type=int, default=60000)
     f.add_argument("--keep-json3", action="store_true")
 
-    a = p.parse_args()
+    a = p.parse_args(_rescue_leading_dash_id(sys.argv[1:]))
     try:
         if a.cmd == "resolve":
             out({"ok": True, "channel_id": resolve_channel_id(a.channel)})
