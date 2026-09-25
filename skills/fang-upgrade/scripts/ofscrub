@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""ofscrub — check that this tree keeps README.md's placeholder promise.
+
+README.md says: addresses and host names appear as <tailnet-ip>, <public-ip>,
+<tailnet-host>, the passkey relying party as <rp-host> and a passkey slot as
+<slot> — substitute your own. Nothing enforced that, and it was broken by hand
+twice. This enforces it.
+
+    ofscrub            # scan the skill tree this script lives in
+    ofscrub <dir>      # scan another tree
+    ofscrub --list     # print the rules and the reasoning, exit 0
+
+Exit codes: 0 clean · 1 at least one hit · 2 bad arguments.
+It REPORTS. It never edits a file.
+
+WHAT IT LOOKS FOR, AND WHY IT IS NOT A LIST OF NAMES
+----------------------------------------------------
+Three earlier versions of this idea kept a list of the strings that had leaked —
+first in plain text, then as (length, FNV-1a, SHA-256) triples. Both are broken
+for the same reason: this repository is public, so anything it must recognise it
+must also carry, and a short guessable string behind an unsalted digest with its
+length published is a dictionary attack, not a secret. A public file cannot hold
+a secret salt. So the guard stopped trying to recognise *which* names and
+recognises *shapes* instead. It has nothing to hide, and it catches values that
+never leaked from here — including yours.
+
+Two legs, because install-specific values arrive in two different ways:
+
+  Leg 1 — the VALUE has the shape.  Some literals are specific to one machine no
+      matter whose machine it is: an IP address that is globally routable points
+      at exactly one host on the public internet; an address in the carrier-NAT
+      range that Tailscale hands out points at exactly one node of one tailnet;
+      a name under Tailscale's MagicDNS zone is minted per tailnet. Nothing about
+      ownership is consulted — only whether the literal, by its own arithmetic,
+      designates a particular machine.
+      The line between guilty and innocent is drawn by IANA, not by this file:
+      loopback, the RFC 1918 private ranges, link-local, multicast, the benchmark
+      range and the RFC 5737 / RFC 3849 documentation ranges all designate nobody
+      in particular, which is exactly why examples are supposed to use them.
+      `ipaddress.ip_address(x).is_global` is that line, already maintained in the
+      standard library, so this file does not restate it and cannot drift from it.
+
+  Leg 2 — the SLOT has the shape.  The rest are ordinary words — a relying-party
+      host, a passkey slot name — that no amount of staring at the text can tell
+      from a placeholder. What CAN be told by shape is the key they are assigned
+      to: a value written into `rp_id`, `rp_origin`, the `id` of a WebAuthn `rp`
+      object, a passkey `slot`, or an `openfang auth` subcommand's slot argument
+      IS this install's identity by definition of the key. So the rule is on the
+      key, and the value is forgiven only when it is a <placeholder>, empty, a
+      name RFC 2606 / RFC 6761 reserves for documentation (.example, .invalid,
+      .test, .localhost, example.com/.net/.org), or an address Leg 1 already
+      calls innocent. The list in this file is a list of KEYS, not of values —
+      it gives away nothing about who runs this install.
+
+WHAT IT CANNOT SEE, stated so nobody mistakes green for proof
+------------------------------------------------------------
+  · a bare domain or host name in running prose. `moone.dev`, `github.com` and
+    `northwind-lab.io` are the same shape; only ownership separates them, and
+    ownership is the thing this guard deliberately does not know. Prose that must
+    name a host has to use a slot, or a reserved documentation name.
+  · a container, volume or account name, for the same reason: `openfang-x-1` is
+    shaped exactly like every other container name.
+  · a secret with no structure (an API key that is only base64) — that is
+    `ofdoctor`'s leak scan, not this one.
+
+HOW A HIT IS REPORTED
+---------------------
+By file and line number only. The old version printed the matching line in full,
+so its own report republished the very string it exists to keep out of the tree —
+and reports get pasted into issues and chat. The path and line are enough to act
+on for whoever holds the tree, and are nothing to whoever does not.
+
+It scans ITSELF like every other file. The rules describe shapes, so they do not
+contain the shapes they describe; a version of this file that had to be exempted
+from its own scan would be evidence that it was still carrying a list.
+"""
+
+import ipaddress
+import os
+import re
+import sys
+
+# Addresses that Tailscale publishes as the same on every tailnet: they are part
+# of the product, not of any one install, and are the only carrier-NAT literals a
+# document has a reason to print. Naming them here reveals nothing about anyone —
+# they are identical for every user of Tailscale.
+SHARED_TAILNET_INFRA = frozenset({"100.100.100.200"})
+
+TAILNET_RANGE = ipaddress.ip_network("100.64.0.0/10")
+
+# Suffixes RFC 2606 and RFC 6761 reserve so that documentation has names that
+# cannot belong to anybody.
+RESERVED_SUFFIXES = (".example", ".invalid", ".test", ".localhost",
+                     "example.com", "example.net", "example.org")
+
+SKIP_DIRS = {".git", "__pycache__", "node_modules", ".mypy_cache"}
+
+V4 = re.compile(r"(?<![0-9A-Za-z._:-])(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
+                r"(?![0-9A-Za-z._-])")
+V6 = re.compile(r"(?<![0-9A-Za-z:.])(?=[0-9A-Fa-f:]*::|(?:[0-9A-Fa-f]{1,4}:){7})"
+                r"[0-9A-Fa-f:]{3,}(?:[0-9A-Fa-f]|::)(?![0-9A-Za-z:])")
+MAGICDNS = re.compile(r"(?<![0-9A-Za-z.-])[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*"
+                      r"\.ts\.net(?![0-9A-Za-z.-])")
+
+# Leg 2: the keys whose value IS this install's identity. Written as one
+# alternation per shape the documents actually use, so that a value which moves
+# from TOML to JSON to a command line does not walk out through a gap.
+# A value is read as the whole quoted string when it is quoted, and as one bare
+# token otherwise; the matching group is whichever alternative fired. Capturing
+# only up to the first space would read `"<a placeholder>"` as `<a` and call a
+# placeholder a leak.
+VALUE = r"(?:\"([^\"]*)\"|'([^']*)'|([^\s,}\]]+))"
+
+SLOT_PATTERNS = (
+    # rp_id / rp_origin in TOML, JSON or on a command line
+    re.compile(r"\brp[_-]?(?:id|origin)\b\"?\s*[:=]-?\s*" + VALUE),
+    # the id of a WebAuthn rp object
+    re.compile(r"\"rp\"\s*:\s*\{[^}]*?\"id\"\s*:\s*" + VALUE),
+    # a passkey slot as a key/value pair or a flag
+    re.compile(r"(?<![0-9A-Za-z_])\"?slot\"?\s*[:=]-?\s*(?:\"([^\"]*)\"|'([^']*)')"),
+    re.compile(r"--slot[ =]+" + VALUE),
+    # the slot argument of an openfang auth subcommand
+    re.compile(r"\bauth\s+(?:invite|revoke|reset-slot)\s+" + VALUE),
+    # the install's own base URL, as opposed to a provider's.  `[:=]-?` also
+    # covers the shell default-value form ${VAR:-...}.
+    re.compile(r"\bOPENFANG_URL\b\s*[:=]-?\s*" + VALUE),
+)
+
+
+def parse_ip(text):
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+def designates_a_host(addr):
+    """True when this literal points at ONE machine on the public internet.
+
+    `is_global` is the standard library's own reading of the IANA special-purpose
+    registries and is what draws the line; multicast is subtracted because a group
+    address is global and yet designates no host (224.0.0.1 and ff02::1 are the
+    same on every network in the world)."""
+    return addr.is_global and not addr.is_multicast
+
+
+def innocent_host(value):
+    """True when the value names nobody: a placeholder, empty, a reserved
+    documentation name, or an address Leg 1 already forgives."""
+    v = value.strip().strip("`'\"").rstrip("}")
+    if not v or v in ("...", "…"):
+        return True
+    if "<" in v and ">" in v:
+        return True
+    # strip scheme, path, port so that a URL is judged on its host
+    v = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", v)
+    v = v.split("/", 1)[0].split("?", 1)[0]
+    if v.startswith("["):                       # [::1]:4200
+        v = v[1:].split("]", 1)[0]
+    else:
+        v = re.sub(r":[0-9]+$", "", v)
+    if not v:
+        return True
+    if "<" in v and ">" in v:
+        return True
+    addr = parse_ip(v)
+    if addr is not None:
+        return not designates_a_host(addr) and addr not in TAILNET_RANGE
+    low = v.lower().rstrip(".")
+    return any(low == s.lstrip(".") or low.endswith(s)
+               for s in RESERVED_SUFFIXES)
+
+
+def scan_line(line):
+    """Rule names triggered by this line."""
+    out = []
+
+    for m in V4.finditer(line):
+        addr = parse_ip(m.group())
+        if addr is None:
+            continue
+        if addr in TAILNET_RANGE:
+            after = line[m.end():]
+            if re.match(r"/[0-9]{1,2}(?![0-9])", after):
+                continue                    # a CIDR range names no host
+            if m.group() not in SHARED_TAILNET_INFRA:
+                out.append("tailnet address literal (must be <tailnet-ip>)")
+        elif designates_a_host(addr):
+            out.append("globally routable IP literal (must be <public-ip>)")
+
+    for m in V6.finditer(line):
+        addr = parse_ip(m.group())
+        if addr is not None and designates_a_host(addr):
+            out.append("globally routable IP literal (must be <public-ip>)")
+
+    if MAGICDNS.search(line):
+        out.append("MagicDNS host name (must be <tailnet-host>)")
+
+    for pat in SLOT_PATTERNS:
+        for m in pat.finditer(line):
+            value = next((g for g in m.groups() if g is not None), "")
+            if not innocent_host(value):
+                out.append("identity slot holding a real value "
+                           "(must be <rp-host> / <slot>)")
+    return out
+
+
+def is_text(path):
+    try:
+        with open(path, "rb") as fh:
+            chunk = fh.read(8192)
+    except OSError:
+        return False
+    return b"\0" not in chunk
+
+
+def main(argv):
+    root = None
+    if len(argv) > 1:
+        if argv[1] in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        if argv[1] == "--list":
+            print(__doc__)
+            return 0
+        if argv[1].startswith("-"):
+            print(f"ofscrub: unknown option: {argv[1]}", file=sys.stderr)
+            return 2
+        root = argv[1]
+    if len(argv) > 2:
+        print("ofscrub: at most one directory", file=sys.stderr)
+        return 2
+    if root is None:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if not os.path.isdir(root):
+        print(f"ofscrub: not a directory: {root}", file=sys.stderr)
+        return 2
+
+    print(f"ofscrub: scanning {root} "
+          f"(skipping {', '.join(sorted(SKIP_DIRS))}/ and binary files; "
+          f"this script is scanned like any other)")
+
+    hits = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path) or not is_text(path):
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="strict") as fh:
+                    lines = fh.read().splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            rel = os.path.relpath(path, root)
+            for n, line in enumerate(lines, 1):
+                for rule in scan_line(line):
+                    hits.setdefault(rule, []).append(f"{rel}:{n}")
+
+    rules_seen = [
+        "globally routable IP literal (must be <public-ip>)",
+        "tailnet address literal (must be <tailnet-ip>)",
+        "MagicDNS host name (must be <tailnet-host>)",
+        "identity slot holding a real value (must be <rp-host> / <slot>)",
+    ]
+    for rule in rules_seen:
+        where = hits.get(rule)
+        if where:
+            print(f"HIT  {rule}")
+            # location only: the report must not republish the value.
+            for loc in where:
+                print(f"       {loc}")
+        else:
+            print(f"ok   {rule}")
+
+    if hits:
+        print("ofscrub: FAIL — README.md's placeholder promise is not true right "
+              "now. Open the lines above; the values are deliberately not "
+              "printed here.")
+        return 1
+    print("ofscrub: clean")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

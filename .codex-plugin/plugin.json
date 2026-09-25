@@ -1,0 +1,19 @@
+{
+  "name": "fang-upgrade",
+  "version": "0.1.0",
+  "description": "Operate the maintained fang-upgrade fork with explicit target discovery and local runbooks.",
+  "author": {"name": "kyzdes"},
+  "repository": "https://github.com/kyzdes/fang-upgrade-skill",
+  "license": "Apache-2.0 OR MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Fang Upgrade",
+    "shortDescription": "Operate and diagnose the maintained OpenFang fork.",
+    "longDescription": "Target-aware operator guidance for daemon lifecycle, agents, hands, schedules, providers, channels, backups, and the maintained fang-upgrade fork. Scripts require the actual target to be resolved before changes.",
+    "developerName": "kyzdes",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/kyzdes/fang-upgrade-skill",
+    "defaultPrompt": ["Check the current fang-upgrade installation and explain any problems."]
+  }
+}

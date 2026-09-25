@@ -17,13 +17,37 @@ unmodified OpenFang, treat its content as a frozen snapshot rather than a mainta
 | `scripts/` | thirteen scripts: `ofctl` (authenticated API calls), `ofdoctor` (health pass with a secret-leak scan), `ofhand`, `ofcron`, `ofbackup`, `oftarget.py` (works out *which* install a tool is about to act on, and refuses when that is not unique), `ofcheck-rs`, `ofgate` (the three cargo commands Fork CI's `check` job runs — **not** a gate; see `scripts/README.md`), `ofmutate` (proves a patch's test goes red without the patch), `ofledger` (rolls up the workflow journals), `ofscrub` (checks the placeholder promise below), plus intake tools for YouTube and RuTube |
 | `evals/` | trigger evaluations for the skill description |
 
-## Install
+## Install from the marketplace
+
+Claude Code:
+
+```text
+/plugin marketplace add kyzdes/claude-skills
+/plugin install fang-upgrade@claude-skills
+```
+
+Codex CLI:
+
+```text
+codex plugin marketplace add https://github.com/kyzdes/claude-skills.git
+codex plugin add fang-upgrade@claude-skills
+```
+
+The packaged skill lives in `skills/fang-upgrade/`. Use the path of the loaded
+`SKILL.md` to resolve its scripts and assets. No daemon, MCP server, or updater
+starts during installation. Native host update policy controls updates.
+
+The old `openfang@claude-skills` entry migrates to `fang-upgrade`. Existing users
+must install the new plugin once; the old upstream skill is an archived snapshot.
+
+## Standalone install (still supported)
 
 ```bash
 mkdir -p ~/.claude/skills
 git clone https://github.com/kyzdes/fang-upgrade-skill.git ~/.claude/skills/fang-upgrade
 chmod +x ~/.claude/skills/fang-upgrade/scripts/*
-export PATH="$HOME/.claude/skills/fang-upgrade/scripts:$PATH"
+export FANG_SKILL_DIR="$HOME/.claude/skills/fang-upgrade"
+export PATH="$FANG_SKILL_DIR/scripts:$PATH"
 ```
 
 Point the tools at your install. **They do not ship a default target.** `ofdoctor`,
@@ -34,7 +58,7 @@ picked the live one for anybody running a staging box beside it. Now the target 
 discovered from the running containers and **refused when it is not unique**:
 
 ```bash
-scripts/oftarget.py show          # which container, which data directory, and how each was decided
+oftarget.py show                  # which container, which data directory, and how each was decided
 export OPENFANG_URL=http://127.0.0.1:4200
 export OPENFANG_CONTAINER=<container>     # only needed when more than one is running
 ofctl -x version GET /api/health
@@ -82,3 +106,25 @@ running daemon still disagree, **the daemon is right**. Reporting the mismatch i
 working around it.
 
 Licence: same as upstream OpenFang, Apache-2.0 OR MIT.
+
+## Package validation
+
+Use Python 3.12.4 or newer for these package checks: older `ipaddress` data can
+misclassify reserved addresses in the scrubber. This requirement applies to the
+checks, not to all operator scripts.
+
+The root skill remains canonical for existing standalone clones. After editing
+`SKILL.md`, `references/`, `scripts/`, or `assets/`, run:
+
+```bash
+python3 scripts/build_plugin.py
+python3 scripts/build_plugin.py --check
+python3 -m pip install PyYAML
+python3 scripts/validate_package.py
+python3 -m unittest discover -s tests
+python3 scripts/ofscrub
+claude plugin validate .
+```
+
+CI rejects a generated payload that differs from canonical files. Bump both
+plugin manifests for each packaged release.

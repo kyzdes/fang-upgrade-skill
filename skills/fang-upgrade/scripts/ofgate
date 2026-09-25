@@ -1,0 +1,582 @@
+#!/bin/sh
+# ofgate <worktree> [--only fmt,clippy,test] [--wait] — гоняет локально ровно то,
+# что гоняет Fork CI, и сообщает результат кодом выхода.
+#
+# ЗАЧЕМ ОН ЕСТЬ, если рядом лежит ofcheck-rs.
+#
+# 1. ofcheck-rs не умеет покраснеть. Его последняя строка —
+#      cargo check $ARGS 2>&1 | tail -40
+#    Код выхода конвейера это код `tail`, то есть всегда 0. Проверено:
+#      docker run --rm alpine sh -c "false | tail -40"; echo $?   →   0
+#    Здесь конвейеров нет: каждый шаг — отдельный контейнер, его код читает
+#    `docker wait`, и этот код проверяется на «это вообще число».
+# 2. ofcheck-rs гоняет только `cargo check`. CI гоняет fmt, clippy и test —
+#    команды взяты дословно из .github/workflows/fork-ci.yml.
+# 3. `tail -40` резал список ошибок. Здесь полный вывод пишется в файл,
+#    в терминал идёт сводка со ссылкой на него.
+#
+# КОДЫ ВЫХОДА
+#   0  все запрошенные проверки зелёные
+#   1  хотя бы одна проверка красная
+#   2  ошибка аргументов
+#   3  ОТКАЗ ИНСТРУМЕНТА — не дефект проверяемого дерева. Три причины:
+#        · не хватает места на диске (арифметика ниже);
+#        · том цели сборки принадлежит другому дереву и не может быть занят;
+#        · шаг упал не на коде, а на том, что /build смонтирован только на чтение.
+#   4  прогон НЕ УЛОЖИЛСЯ в собственный дедлайн ofgate. Контейнер убит, том
+#      освобождён, напечатан частичный блок вердикта и команда для фонового
+#      перезапуска. Это тоже не дефект дерева.
+#
+# ЧТО ИМЕННО ГОНЯЕТСЯ: три команды ниже (CMD_fmt/CMD_clippy/CMD_test) скопированы
+# из .github/workflows/fork-ci.yml, job `check`, а не написаны по памяти. Порядок
+# и останов на первой красной — как в CI.
+#
+# И ЧТО НЕ ГОНЯЕТСЯ: всё остальное из того же workflow. Ни checkout, ни установка
+# тулчейна, ни шаг «версии тулчейна сходятся во всех четырёх местах» (он краснеет,
+# когда rust-toolchain.toml, rust-version в Cargo.toml, FROM rust: в Dockerfile и
+# toolchain: в самом workflow разъехались, — этой красноты ofgate не покажет), ни
+# rust-cache, ни apt-get с системными зависимостями Tauri, ни вторая джоба `image`
+# со сборкой Dockerfile. Зелёный ofgate значит «три команды cargo прошли на моём
+# дереве», и ничего шире.
+#
+# ── ПРО БЛОК ВЕРДИКТА: ЧЕСТНО ────────────────────────────────────────────────
+# Блок вердикта НЕ ЗАЩИЩЁН ОТ ПОДДЕЛКИ и не может быть ею защищён в этой схеме.
+# Закрывающая строка — sha256 того же тела, которое напечатано выше; строки шагов —
+# sha256 файлов, которые пишет тот же процесс; ключа в инструменте нет:
+# `sed 's/#.*//' ofgate | grep -c 'hmac\|secret\|OFGATE_KEY\|openssl'` → 0.
+# (Без `sed` там `1` — этот самый комментарий и находится. Прошлая редакция
+# приводила голый grep как доказательство, и он не воспроизводился.) Полный
+# самосогласованный GREEN-блок собирается руками одной командой `sha256sum`, и
+# cargo при этом не запускается — проверено.
+# Что блок даёт на самом деле, и только это:
+#   · машиночитаемую форму фиксированной ширины, которую можно распарсить;
+#   · ссылку на логи, которые остаются на диске: их можно прочитать и пересчитать;
+#   · привязку к содержимому дерева (строка `binding`) и к образу тулчейна.
+# Доверять блоку как доказательству можно только после ПЕРЕЗАПУСКА гейта тем, кто
+# проверяет: логи лежат на диске по пути из строки `logs:`, дерево и образ названы
+# в строке `binding` — перезапуск проверяющего по ним воспроизводится. Отдельного
+# инструмента для этого НЕТ: `ofverify` не существует, и прошлая редакция этой
+# шапки отсылала к нему зря. ofgate сам себя не заверяет.
+#
+# ── ПРО ИЗОЛЯЦИЮ ЦЕЛИ СБОРКИ ────────────────────────────────────────────────
+# Болезнь описана в шапке ofcheck-rs: общий CARGO_TARGET_DIR на несколько worktree
+# МОЛЧА возвращал чужой результат, потому что отпечатки cargo завязаны на путь и
+# mtime, а внутри контейнера все worktree монтируются по одному пути /build.
+# Имя тома по одному basename эту болезнь НЕ лечит: два разных дерева с одинаковым
+# именем каталога делят том и получают чужой ответ (проверено — /root/ofgfix-twinA/twin
+# и /root/ofgfix-twinB/twin, второй с clippy::approx_constant, получал GREEN).
+# Поэтому владение томом закреплено меткой .ofgate-owner внутри самого тома:
+#   · тома нет            → создаём, пишем метку с реальным путём дерева;
+#   · метка совпала       → это наш том, идём инкрементально;
+#   · метка чужая         → берём отдельный том fang-target-<slug>-<hash пути>;
+#   · метки нет (том от старой версии) → НЕ занимаем молча. По умолчанию уходим на
+#     том с хэшем пути; занять старый том можно только явно, OFGATE_ADOPT_LEGACY_VOL=1,
+#     и только тем, кто знает, какое дерево его набивало.
+set -eu
+
+SELF=$(readlink -f "$0")
+SELFDIR=$(dirname "$SELF")
+IMAGE_TAG=ofgate-build:1.91
+IMAGE_DIR="$SELFDIR/ofgate-image"
+ALL_CHECKS="fmt clippy test"
+OWNER_STAMP=".ofgate-owner"
+
+usage() {
+    cat >&2 <<EOF
+ofgate <worktree> [--only fmt,clippy,test] [--wait]
+
+  --only LIST   подмножество проверок через запятую (fmt, clippy, test).
+                По умолчанию — все три, в порядке CI.
+  --wait        «я запущен фоном» — поднимает СОБСТВЕННЫЙ дедлайн ofgate с
+                ${FG_DEADLINE_DEFAULT}с до ${BG_DEADLINE_DEFAULT}с. Это бюджет времени, а не разрешение:
+                без него ofgate не зависает на переднем плане, а завершается
+                кодом 4 ДО потолка Bash в 600 с и печатает, как дождаться.
+
+коды выхода: 0 зелено · 1 красное · 2 аргументы · 3 отказ инструмента · 4 не уложился
+
+OFGATE_DEADLINE_S        дедлайн в секундах, перекрывает и --wait
+OFGATE_DISK_MIN_G        требуемое свободное место в ГБ (должно быть целым числом)
+OFGATE_LOG_DIR           корень журналов (по умолчанию /var/tmp/ofgate)
+OFGATE_ADOPT_LEGACY_VOL  1 — занять том без метки владельца (см. шапку файла)
+EOF
+}
+
+# --- дедлайн: ofgate следит за собственным временем ---------------------------
+# Потолок timeout у Bash — 600000 мс; запрос больше молча обрезается до десяти
+# минут, и вызов возвращает "Command timed out after 10m 0s", хотя команда жива.
+# Предыдущая версия «запрещала» длинный режим на переднем плане, но переднего
+# плана не определяла — смотрела только на флаг --wait, то есть отказ обходился
+# аргументом и отказом не был. Теперь правило исполняется, а не обещается:
+# ofgate ждёт контейнер через `timeout <остаток> docker wait`, и когда бюджет
+# кончился — УБИВАЕТ контейнер и выходит с 4. На переднем плане бюджет заведомо
+# меньше потолка Bash, поэтому молчаливого обреза не бывает.
+FG_DEADLINE_DEFAULT=540     # 9 минут: потолок Bash 600 с минус запас на печать
+BG_DEADLINE_DEFAULT=14400   # 4 часа: измеренный холодный полный прогон 1248–1615 с
+
+WT=""
+ONLY=""
+WAIT=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --only) [ $# -ge 2 ] || { echo "ofgate: --only без значения" >&2; usage; exit 2; }
+                ONLY=$2; shift 2 ;;
+        --only=*) ONLY=${1#--only=}; shift ;;
+        --wait) WAIT=1; shift ;;
+        -h|--help) usage; exit 2 ;;
+        -*) echo "ofgate: неизвестный флаг: $1" >&2; usage; exit 2 ;;
+        *)  [ -z "$WT" ] || { echo "ofgate: лишний аргумент: $1" >&2; usage; exit 2; }
+            WT=$1; shift ;;
+    esac
+done
+
+[ -n "$WT" ] || { echo "ofgate: не указан worktree" >&2; usage; exit 2; }
+[ -d "$WT" ] || { echo "ofgate: нет каталога: $WT" >&2; exit 2; }
+WT=$(readlink -f "$WT")
+[ -f "$WT/Cargo.toml" ] || { echo "ofgate: в $WT нет Cargo.toml — это не рабочая область" >&2; exit 2; }
+
+# --- числа проверяются на «это число» ----------------------------------------
+# Мелочь, которая выключала гейт диска целиком: OFGATE_DISK_MIN_G=lots давало
+# `[: Illegal number: lots`, dash возвращал из `[` код 2, `if` читал это как
+# «места хватает» и прогон шёл дальше с EXIT=0. Тот же класс, что код `tail` в
+# ofcheck-rs: неудача сравнения прочитана как успех. Поэтому каждое число,
+# попадающее в сравнение, сначала проверяется — и непонятное число это отказ,
+# а не «наверное, всё хорошо».
+is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+need_uint() {  # need_uint <значение> <как называется> <код выхода>
+    is_uint "$1" && return 0
+    echo "ofgate: $2 должно быть целым неотрицательным числом, а получено '$1'" >&2
+    echo "  сравнение с не-числом в sh не падает, а возвращает код 2, и это молча" >&2
+    echo "  читается как «условие ложно». Поэтому здесь отказ, а не продолжение." >&2
+    exit "$3"
+}
+
+if [ -n "${OFGATE_DEADLINE_S:-}" ]; then
+    need_uint "$OFGATE_DEADLINE_S" "OFGATE_DEADLINE_S" 2
+    DEADLINE_S=$OFGATE_DEADLINE_S
+elif [ "$WAIT" -eq 1 ]; then
+    DEADLINE_S=$BG_DEADLINE_DEFAULT
+else
+    DEADLINE_S=$FG_DEADLINE_DEFAULT
+fi
+
+# --- какие проверки гоняем, в порядке CI -------------------------------------
+CHECKS=""
+if [ -z "$ONLY" ]; then
+    CHECKS=$ALL_CHECKS
+else
+    for c in $(echo "$ONLY" | tr ',' ' '); do
+        case " $ALL_CHECKS " in
+            *" $c "*) ;;
+            *) echo "ofgate: неизвестная проверка '$c'; допустимы: fmt, clippy, test" >&2; exit 2 ;;
+        esac
+    done
+    for c in $ALL_CHECKS; do
+        case " $(echo "$ONLY" | tr ',' ' ') " in
+            *" $c "*) CHECKS="$CHECKS $c" ;;
+        esac
+    done
+    CHECKS=$(echo "$CHECKS" | sed 's/^ *//')
+    [ -n "$CHECKS" ] || { echo "ofgate: --only не выбрал ни одной проверки" >&2; exit 2; }
+fi
+has_check() { case " $CHECKS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# --- выбор тома цели сборки по ВЛАДЕЛЬЦУ, а не по имени каталога -------------
+BASESLUG=$(basename "$WT" | tr -c 'a-zA-Z0-9_.-' '-')
+PATHHASH=$(printf '%s' "$WT" | sha256sum | cut -c1-12)
+VOL_NOTE=""
+
+vol_owner() {  # печатает записанного владельца тома, пусто если метки нет
+    _d="/var/lib/docker/volumes/$1/_data/$OWNER_STAMP"
+    [ -f "$_d" ] && head -1 "$_d" || true
+}
+vol_exists() { docker volume inspect "$1" >/dev/null 2>&1; }
+
+TGT="fang-target-$BASESLUG"
+TGT_HASHED="fang-target-${BASESLUG}${PATHHASH}"
+if ! vol_exists "$TGT"; then
+    :   # тома нет — создадим и подпишем своим путём
+else
+    OWNER=$(vol_owner "$TGT")
+    if [ -z "$OWNER" ]; then
+        if [ "${OFGATE_ADOPT_LEGACY_VOL:-0}" = 1 ]; then
+            VOL_NOTE="занят том без метки владельца по OFGATE_ADOPT_LEGACY_VOL=1"
+            echo "ofgate: том $TGT не имеет метки владельца; занимаю его по OFGATE_ADOPT_LEGACY_VOL=1." >&2
+        else
+            TGT=$TGT_HASHED
+            VOL_NOTE="том fang-target-$BASESLUG без метки владельца не занят молча"
+            cat >&2 <<EOF
+ofgate: том fang-target-$BASESLUG существует, но НЕ имеет метки владельца — он от
+  версии ofgate, которая именовала тома по одному basename и потому могла отдать
+  результат сборки ЧУЖОГО дерева с тем же именем каталога. Молча его не занимаю.
+  Иду на отдельный том $TGT (первая сборка будет с нуля).
+  Если ты точно знаешь, что этот том набивало именно $WT — займи его явно:
+    OFGATE_ADOPT_LEGACY_VOL=1 sh $SELF $WT ...
+EOF
+        fi
+    elif [ "$OWNER" != "$WT" ]; then
+        TGT=$TGT_HASHED
+        VOL_NOTE="fang-target-$BASESLUG принадлежит $OWNER"
+        echo "ofgate: том fang-target-$BASESLUG принадлежит другому дереву ($OWNER); беру $TGT." >&2
+    fi
+fi
+# если ушли на хэшированный том — у него тоже может быть чужая метка (коллизия пути
+# невозможна, но том мог остаться от переименованного дерева): проверяем и его.
+if [ "$TGT" = "$TGT_HASHED" ] && vol_exists "$TGT"; then
+    OWNER2=$(vol_owner "$TGT")
+    if [ -n "$OWNER2" ] && [ "$OWNER2" != "$WT" ]; then
+        echo "ofgate: том $TGT принадлежит $OWNER2, а не $WT." >&2
+        echo "  это ОТКАЗ ИНСТРУМЕНТА. Освободи: docker volume rm $TGT" >&2
+        exit 3
+    fi
+fi
+
+# --- отказ по диску -----------------------------------------------------------
+# Порог не плоские 12 ГБ, как у ofcheck-rs, а измеренная арифметика: полная цель
+# сборки форка после fmt+clippy+test по --workspace --all-targets — 22 ГБ.
+# Длинному режиму нужно ровно столько, сколько его тому ещё НЕ хватает до 22 ГБ.
+#
+# Числа берутся ПЕРВЫМ ПОЛЕМ вывода, а не «все цифры из строки». Предыдущая версия
+# делала `du -sBG <путь> | tr -dc '0-9'` и вырезала цифры ИЗ ПУТИ ТОЖЕ:
+#   du -sBG /var/lib/docker/volumes/fang-target-fang-10-47-maxiter/_data
+#     → "4G\t/var/.../fang-target-fang-10-47-maxiter/_data"
+#     → tr -dc '0-9' → 41047
+# то есть у любого каталога с цифрой в имени «занято» становилось астрономическим,
+# NEED_G уходил в минус, прижимался к HEADROOM_G и гейт диска выключался сам.
+FULL_TARGET_G=22
+HEADROOM_G=2
+
+size_g() {  # size_g <каталог> — целые ГБ по ПЕРВОМУ полю du, 0 если каталога нет
+    [ -d "$1" ] || { echo 0; return 0; }
+    du -sBG "$1" 2>/dev/null | awk 'NR==1 {gsub(/[^0-9]/, "", $1); print $1+0; found=1} END {if (!found) print 0}'
+}
+
+FREE_G=$(df -BG --output=avail / | awk 'NR==2 {gsub(/[^0-9]/, "", $1); print $1+0}')
+need_uint "$FREE_G" "свободное место (df -BG --output=avail /)" 3
+USED_G=$(docker volume ls -q | grep '^fang-target' \
+         | xargs -r -I{} du -sBG /var/lib/docker/volumes/{}/_data 2>/dev/null \
+         | awk '{gsub(/[^0-9]/, "", $1); s+=$1+0} END {print s+0}')
+is_uint "$USED_G" || USED_G=0
+TGT_G=$(size_g "/var/lib/docker/volumes/$TGT/_data")
+need_uint "$TGT_G" "размер тома $TGT" 3
+
+if has_check clippy || has_check test; then
+    NEED_G=$((FULL_TARGET_G - TGT_G))
+    [ "$NEED_G" -lt "$HEADROOM_G" ] && NEED_G=$HEADROOM_G
+else
+    NEED_G=$HEADROOM_G
+fi
+if [ -n "${OFGATE_DISK_MIN_G:-}" ]; then
+    need_uint "$OFGATE_DISK_MIN_G" "OFGATE_DISK_MIN_G" 2
+    NEED_G=$OFGATE_DISK_MIN_G
+fi
+if [ "$FREE_G" -lt "$NEED_G" ]; then
+    echo "ofgate: свободно ${FREE_G}G, этому прогону нужно ${NEED_G}G." >&2
+    echo "  полная цель сборки форка измерена в ${FULL_TARGET_G}G; том $TGT сейчас держит ${TGT_G}G." >&2
+    echo "  всего под fang-target-* занято ${USED_G}G в $(docker volume ls -q | grep -c '^fang-target') томах." >&2
+    echo "  удали тома влитых патчей: docker volume rm fang-target-<slug>" >&2
+    echo "  это ОТКАЗ ИНСТРУМЕНТА, а не дефект проверяемого дерева." >&2
+    exit 3
+fi
+[ "$FREE_G" -lt 25 ] && echo "ofgate: свободно всего ${FREE_G}G (цели сборки занимают ${USED_G}G, из них $TGT — ${TGT_G}G)" >&2
+
+# --- образ --------------------------------------------------------------------
+if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+    [ -f "$IMAGE_DIR/Dockerfile" ] || { echo "ofgate: нет образа $IMAGE_TAG и нет $IMAGE_DIR/Dockerfile" >&2; exit 2; }
+    echo "# ofgate: собираю образ $IMAGE_TAG из $IMAGE_DIR (один раз, дальше переиспользуется)" >&2
+    docker build -t "$IMAGE_TAG" "$IMAGE_DIR" >&2 || { echo "ofgate: сборка образа не удалась" >&2; exit 2; }
+fi
+IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE_TAG")
+
+docker volume create "$TGT" >/dev/null
+docker volume create fang-cargo-registry >/dev/null
+# метка владельца пишется ИЗ КОНТЕЙНЕРА: том может быть пустым и ещё не иметь
+# каталога на хосте.
+docker run --rm -v "$TGT":/target "$IMAGE_TAG" \
+    sh -c "printf '%s\n' '$WT' > /target/$OWNER_STAMP" >/dev/null 2>&1 || true
+
+# --- журналы ------------------------------------------------------------------
+RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$
+LOG_ROOT=${OFGATE_LOG_DIR:-/var/tmp/ofgate}
+LOG_DIR="$LOG_ROOT/$BASESLUG/$RUN_ID"
+mkdir -p "$LOG_DIR"
+
+# --- /build ПИШУЩИЙ, но дерево пользователя неприкосновенно ------------------
+# Прежде дерево монтировалось прямо в /build с флагом :ro, и это ломало ровно то,
+# ради чего гейт существует. Cargo переписывает Cargo.lock всякий раз, когда патч
+# добавил зависимость, и на :ro получалось
+#   error: failed to write /build/Cargo.lock ... Read-only file system (os error 30)
+#   --- clippy : RED exit=101   →   exit 1
+# то есть ОТКАЗ ИНСТРУМЕНТА печатался как красный патч при безупречном коде: на
+# пишущем checkout, как в Fork CI, тот же патч зелёный. Воспроизведено на канарейке.
+#
+# Теперь дерево монтируется :ro в /src, а /build — tmpfs, куда оно копируется
+# `cp -a` в начале каждого шага. Почему именно так:
+#   · /build пишущий, как checkout в CI: cargo волен переписать Cargo.lock и всё,
+#     что ему нужно; отказа по read-only не возникает вовсе;
+#   · дерево пользователя не меняется ни на байт — писать некуда, /src это :ro;
+#   · путь остаётся /build и `cp -a` сохраняет mtime, поэтому отпечатки cargo
+#     остаются валидными и инкрементальная сборка на томе цели не теряется;
+#   · копия живёт в tmpfs и исчезает вместе с контейнером — мусора не остаётся.
+# Измерено на /root/src/openfang (35 МБ вместе с .git): копия 1.2 с.
+WT_KB=$(du -sk "$WT" 2>/dev/null | awk 'NR==1{print $1+0}')
+is_uint "$WT_KB" || WT_KB=0
+SRC_TMPFS_M=$(( WT_KB / 1024 * 3 + 512 ))
+if [ "$SRC_TMPFS_M" -gt 4096 ]; then
+    echo "ofgate: дерево $WT занимает $((WT_KB / 1024)) МБ — для tmpfs-копии /build это слишком много." >&2
+    echo "  это ОТКАЗ ИНСТРУМЕНТА, а не дефект дерева. Убери из дерева лишнее (target/?) или подними лимит в ofgate." >&2
+    exit 3
+fi
+# Cargo.lock, каким его оставил cargo, вынимается из tmpfs в каталог журналов —
+# это единственное, что нужно видеть снаружи.
+CP_FAIL_RC=111
+
+# --- уборка за собой при любом выходе ----------------------------------------
+# Прерванный прогон прежде оставлял ЖИВОЙ контейнер: --rm не срабатывает, если
+# процесс, ждавший контейнер, убит, и контейнер продолжал держать том цели
+# сборки и общий том реестра. Теперь контейнер запускается отсоединённым, его id
+# лежит в CUR_CID, и trap снимает его на INT/TERM/HUP и на обычном выходе.
+CUR_CID=""
+CUR_WPID=""
+cleanup() {
+    _rc=$?
+    trap - EXIT INT TERM HUP
+    # по PID, не `pkill -f`: pkill -f ofgate убил бы и вызвавший шелл
+    [ -n "$CUR_WPID" ] && kill "$CUR_WPID" 2>/dev/null || true
+    if [ -n "$CUR_CID" ]; then
+        docker rm -f "$CUR_CID" >/dev/null 2>&1 || true
+        CUR_CID=""
+    fi
+    exit "$_rc"
+}
+trap cleanup EXIT INT TERM HUP
+
+TC_FILE=$(sed -n 's/^ *channel *= *"\([^"]*\)".*/\1/p' "$WT/rust-toolchain.toml" 2>/dev/null || true)
+TC_IMAGE=$(docker run --rm "$IMAGE_TAG" rustc --version 2>/dev/null || echo "?")
+
+# --- привязка вердикта к СОДЕРЖИМОМУ, а не только к git ----------------------
+# Прежде «не git-дерево (dirty=?)» и «<sha> (dirty=yes)» шли с полноценным GREEN:
+# блок вставляли в отчёт как доказательство, а он не привязывал результат ни к
+# какому содержимому. Теперь всегда считается tree-sha256 — sha256 списка
+# «sha256 файла + имя» по всем файлам дерева (для git — отслеживаемые и
+# неотслеживаемые без .gitignore; иначе — всё, кроме .git/ и target/).
+# Это не подпись и подделке не мешает; это привязка: тот же блок против другого
+# дерева опознаётся как другой.
+if git -C "$WT" rev-parse HEAD >/dev/null 2>&1; then
+    GIT_HEAD=$(git -C "$WT" rev-parse HEAD)
+    if [ -z "$(git -C "$WT" status --porcelain 2>/dev/null)" ]; then GIT_DIRTY=no; else GIT_DIRTY=yes; fi
+    TREE_SHA=$(cd "$WT" && git ls-files -z -co --exclude-standard | xargs -0 -r sha256sum 2>/dev/null | LC_ALL=C sort | sha256sum | cut -c1-32)
+    TREE_N=$(cd "$WT" && git ls-files -co --exclude-standard | wc -l | tr -d ' ')
+else
+    GIT_HEAD="не git-дерево"
+    GIT_DIRTY="?"
+    TREE_SHA=$(cd "$WT" && find . -type f -not -path './.git/*' -not -path './target/*' -print0 | xargs -0 -r sha256sum 2>/dev/null | LC_ALL=C sort | sha256sum | cut -c1-32)
+    TREE_N=$(cd "$WT" && find . -type f -not -path './.git/*' -not -path './target/*' | wc -l | tr -d ' ')
+fi
+if [ "$GIT_DIRTY" = no ]; then
+    BINDING="коммит $GIT_HEAD · дерево чистое · tree-sha256:$TREE_SHA ($TREE_N файлов)"
+elif [ "$GIT_DIRTY" = yes ]; then
+    BINDING="НЕ привязано к коммиту: дерево грязное (HEAD $GIT_HEAD) · tree-sha256:$TREE_SHA ($TREE_N файлов)"
+    echo "ofgate: дерево грязное — результат привязан к tree-sha256:$TREE_SHA, а НЕ к коммиту $GIT_HEAD." >&2
+else
+    BINDING="НЕ привязано к коммиту: это не git-дерево · tree-sha256:$TREE_SHA ($TREE_N файлов)"
+    echo "ofgate: это не git-дерево — результат привязан только к tree-sha256:$TREE_SHA." >&2
+fi
+
+CMD_fmt='cargo fmt --all -- --check'
+CMD_clippy='cargo clippy --workspace --all-targets -- -D warnings'
+CMD_test='cargo test --workspace -- --test-threads=2'
+# ↑ дословно из .github/workflows/fork-ci.yml, job `check`, шаги
+#   «cargo fmt --check», «cargo clippy -D warnings», «cargo test».
+
+BODY="$LOG_DIR/verdict-body.txt"
+: >"$BODY"
+say() { printf '%s\n' "$1" >>"$BODY"; }
+
+STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+T0=$(date +%s)
+
+say "=== OFGATE VERDICT ==="
+say "worktree   : $WT"
+say "commit     : $GIT_HEAD (dirty=$GIT_DIRTY)"
+say "binding    : $BINDING"
+say "image      : $IMAGE_TAG ${IMAGE_ID}"
+say "toolchain  : rust-toolchain.toml=${TC_FILE:-нет} · в образе: $TC_IMAGE"
+say "target-vol : $TGT${VOL_NOTE:+  ($VOL_NOTE)}"
+say "checks     : $(echo "$CHECKS" | tr ' ' ',')  (порядок CI, останов на первой красной)"
+say "started    : $STARTED"
+say "deadline   : ${DEADLINE_S}s (--wait=$WAIT); по исчерпании — контейнер убит, exit 4"
+say "logs       : $LOG_DIR"
+
+# run_step <шаг> <logfile> <команда> — запускает контейнер отсоединённым и ждёт
+# его не дольше, чем осталось от дедлайна. Возвращает код команды; 124 значит
+# «дедлайн», и это НЕ код cargo (cargo такого не отдаёт — см. проверку ниже).
+STEP_RC=0
+STEP_TIMEOUT=0
+run_step() {
+    _step=$1; _log=$2; _cmd=$3
+    _left=$((DEADLINE_S - ($(date +%s) - T0)))
+    if [ "$_left" -le 5 ]; then STEP_TIMEOUT=1; STEP_RC=124; : >"$_log"; return 0; fi
+    CUR_CID=$(docker run -d \
+      --name "ofgate-$RUN_ID-$_step" \
+      -v "$WT":/src:ro \
+      --tmpfs "/build:rw,exec,size=${SRC_TMPFS_M}m" \
+      -v "$TGT":/target \
+      -v "$LOG_DIR":/ofgate-out \
+      -v fang-cargo-registry:/usr/local/cargo/registry \
+      -w /build \
+      -e CARGO_TARGET_DIR=/target \
+      -e CARGO_TERM_COLOR=never \
+      "$IMAGE_TAG" \
+      sh -c "cp -a /src/. /build/ || exit $CP_FAIL_RC
+$_cmd
+_rc=\$?
+cp -f /build/Cargo.lock /ofgate-out/Cargo.lock.after 2>/dev/null || true
+exit \$_rc")
+    # Ждать ОБЯЗАТЕЛЬНО фоновым потомком и `wait`, а не блокирующей командой.
+    # Проверено на канарейке: если написать `timeout N docker wait $CID` прямо,
+    # dash откладывает обработчик сигнала до конца этой команды, и trap не
+    # срабатывает вовсе — `timeout 40 sh ofgate ...` оставил ofgate живым на 621-й
+    # секунде и контейнер вместе с ним. `wait` же прерывается сигналом с
+    # установленным обработчиком, и trap отрабатывает сразу.
+    _wfile="$LOG_DIR/$_step.waitrc"
+    set +e
+    timeout "$_left" docker wait "$CUR_CID" >"$_wfile" 2>/dev/null &
+    _wpid=$!
+    CUR_WPID=$_wpid
+    wait "$_wpid"
+    _trc=$?
+    CUR_WPID=""
+    set -e
+    _wrc=$(awk 'NR==1 {gsub(/[^0-9]/, "", $1); print $1}' "$_wfile" 2>/dev/null || true)
+    docker logs "$CUR_CID" >"$_log" 2>&1 || true
+    if [ "$_trc" -ne 0 ] || ! is_uint "$_wrc"; then
+        # дедлайн (или docker wait сам не дал числа) — контейнер снимаем,
+        # том и реестр освобождаются немедленно
+        STEP_TIMEOUT=1
+        STEP_RC=124
+    else
+        STEP_TIMEOUT=0
+        STEP_RC=$_wrc
+    fi
+    docker rm -f "$CUR_CID" >/dev/null 2>&1 || true
+    CUR_CID=""
+}
+
+FAILED=""
+RC_ANY=0
+TIMED_OUT=""
+TOOLFAIL=""
+for c in $CHECKS; do
+    eval "cmd=\$CMD_$c"
+    log="$LOG_DIR/$c.log"
+    t1=$(date +%s)
+    run_step "$c" "$log" "$cmd"
+    rc=$STEP_RC
+    t2=$(date +%s)
+    dur=$((t2 - t1))
+    bytes=$(wc -c <"$log" | tr -d ' ')
+    dig=$(sha256sum "$log" | cut -c1-16)
+
+    if [ "$STEP_TIMEOUT" -eq 1 ]; then
+        say "--- $c : TIMEOUT  не уложился в дедлайн ${DEADLINE_S}s  (${dur}s)"
+        say "      cmd : $cmd"
+        say "      log : $log  (${bytes} B, sha256:${dig})  — вывод неполный, контейнер убит"
+        TIMED_OUT=$c
+        break
+    fi
+
+    # ОТКАЗ ИНСТРУМЕНТА, а не красный патч. Две причины, обе про инструмент:
+    #   · копия дерева в /build не удалась (код CP_FAIL_RC — cargo его не отдаёт);
+    #   · шаг всё-таки упёрся в запись по read-only пути. Сеть на всякий случай:
+    #     после перехода на пишущий /build такого быть не должно, но «не должно» —
+    #     это не прогон, поэтому проверка остаётся.
+    TF_WHY=""
+    if [ "$rc" -eq "$CP_FAIL_RC" ]; then
+        TF_WHY="не удалось скопировать /src в /build (tmpfs ${SRC_TMPFS_M}m маловат?)"
+    elif [ "$rc" -ne 0 ] && grep -q 'Read-only file system' "$log" 2>/dev/null \
+         && grep -qE 'failed to write /(build|src)' "$log" 2>/dev/null; then
+        TF_WHY="запись по пути, смонтированному только на чтение"
+    fi
+    if [ -n "$TF_WHY" ]; then
+        say "--- $c : TOOLFAIL  exit=$rc  ${dur}s  ($TF_WHY)"
+        say "      cmd : $cmd"
+        say "      log : $log  (${bytes} B, sha256:${dig})"
+        say "      хвост вывода (полный — в файле выше):"
+        tail -15 "$log" | sed 's/^/      | /' >>"$BODY"
+        TOOLFAIL=$c
+        break
+    fi
+
+    if [ "$rc" -eq 0 ]; then verd=GREEN; else verd=RED; fi
+    say "--- $c : $verd  exit=$rc  ${dur}s"
+    say "      cmd : $cmd"
+    say "      log : $log  (${bytes} B, sha256:${dig})"
+    if [ "$rc" -ne 0 ]; then
+        FAILED=$c
+        RC_ANY=1
+        say "      хвост вывода (полный — в файле выше):"
+        tail -15 "$log" | sed 's/^/      | /' >>"$BODY"
+        break
+    fi
+done
+
+STOPPER=${FAILED:-${TIMED_OUT:-$TOOLFAIL}}
+SKIPPED=""
+seen_failed=0
+for c in $CHECKS; do
+    if [ "$seen_failed" -eq 1 ]; then SKIPPED="$SKIPPED $c"; fi
+    if [ "$c" = "$STOPPER" ]; then seen_failed=1; fi
+done
+[ -n "$SKIPPED" ] && say "--- не запускались (останов после $STOPPER):$SKIPPED"
+
+# если cargo переписал Cargo.lock — это факт о дереве, его надо видеть.
+# Дерево при этом не тронуто: писалась tmpfs-копия, вынутая в $LOG_DIR.
+LOCK_AFTER="$LOG_DIR/Cargo.lock.after"
+if [ -f "$LOCK_AFTER" ]; then
+    if [ ! -f "$WT/Cargo.lock" ]; then
+        say "note       : в дереве нет Cargo.lock; cargo сгенерировал его — копия в $LOCK_AFTER"
+    elif ! cmp -s "$WT/Cargo.lock" "$LOCK_AFTER"; then
+        say "note       : cargo переписал Cargo.lock (дерево не изменено; как вышло — $LOCK_AFTER)"
+    fi
+fi
+
+T3=$(date +%s)
+if [ -n "$TIMED_OUT" ]; then
+    EXIT_CODE=4
+    say "result     : TIMEOUT — прогон не уложился в ${DEADLINE_S}s на шаге $TIMED_OUT; контейнер убит"
+    say "             это НЕ дефект дерева и НЕ красная проверка"
+elif [ -n "$TOOLFAIL" ]; then
+    EXIT_CODE=3
+    say "result     : TOOLFAIL — отказ инструмента на шаге $TOOLFAIL, дерево не проверено"
+    say "             это НЕ дефект дерева и НЕ красная проверка"
+elif [ "$RC_ANY" -eq 0 ]; then
+    EXIT_CODE=0
+    say "result     : GREEN — все запрошенные проверки прошли"
+else
+    EXIT_CODE=1
+    say "result     : RED — упала проверка: $FAILED"
+fi
+say "elapsed    : $((T3 - T0))s"
+say "exit       : $EXIT_CODE"
+
+DIG=$(sha256sum "$BODY" | cut -c1-32)
+cat "$BODY"
+printf '=== END OFGATE VERDICT run=%s body-sha256=%s ===\n' "$RUN_ID" "$DIG"
+# Напоминание, а не гарантия: см. блок «ПРО БЛОК ВЕРДИКТА» в шапке файла.
+printf 'ofgate: блок выше НЕ заверен — он самоподписан и подделывается вручную. Доказательство — перезапуск гейта проверяющим.\n' >&2
+
+if [ -n "$TIMED_OUT" ]; then
+    ONLY_ECHO=$(echo "$CHECKS" | tr ' ' ',')
+    cat >&2 <<EOF
+
+ofgate: дедлайн ${DEADLINE_S}s исчерпан на шаге $TIMED_OUT, контейнер снят, том $TGT свободен.
+  Потолок timeout у Bash — 600000 мс: запрос больше молча обрезается до десяти
+  минут, поэтому ofgate завершается САМ и раньше, а не оставляет зависший вызов.
+
+  Запусти фоном (Bash run_in_background: true) — там дедлайн ${BG_DEADLINE_DEFAULT}s:
+
+    sh $SELF $WT --only $ONLY_ECHO --wait
+EOF
+fi
+
+exit "$EXIT_CODE"

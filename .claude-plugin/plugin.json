@@ -1,0 +1,8 @@
+{
+  "name": "fang-upgrade",
+  "version": "0.1.0",
+  "description": "Operate the maintained fang-upgrade fork and diagnose OpenFang v0.6.9 with explicit target discovery, runbooks, and local operator scripts.",
+  "author": {"name": "kyzdes"},
+  "repository": "https://github.com/kyzdes/fang-upgrade-skill",
+  "license": "Apache-2.0 OR MIT"
+}
